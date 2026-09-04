@@ -1,23 +1,25 @@
 # VoiceMerge9000
 
-VoiceMerge9000 is a one-screen character voice casting desk for scenes, songs, and dialogue. Upload one audio file, review who speaks where, assign a different RVC model to each speaker, then click **Convert all + merge**. The app converts only the reviewed cues, rebuilds full-length speaker stems at their original timestamps, and mixes them against the original scene.
+VoiceMerge9000 is a one-screen character voice casting desk for scenes, songs, and dialogue. Upload one audio file, review who speaks where, assign a different RVC model to each speaker, then click **Convert all + merge**. The local engine separates the soundtrack, converts only confirmed speech, rebuilds full-length speaker stems at their original timestamps, and mixes them with the separated stereo background.
 
 Use fictional, stylized, public-domain, or otherwise authorized voices. The project does not bundle voice models and must not be used to impersonate a real person without permission.
 
 ## What is implemented
 
-- Browser-local speech-activity detection and an editable acoustic speaker draft
+- `htdemucs` two-stem vocal/background separation on the local GPU
+- Silero VAD over the isolated vocal stem and an editable acoustic speaker draft
 - One to six independent Voice A–F character assignments
 - In-app `voice-models.com` search, samples, metadata, and direct model selection
 - A same-origin job API: the user never has to open a second converter
-- A typed FastAPI service with upload, progress, per-speaker tracks, and deletion endpoints
+- A typed two-stage FastAPI service with analysis, conversion, progress, background/master/per-speaker tracks, and deletion endpoints
 - Official RVC CLI inference, CUDA detection with CPU fallback, and one model load per speaker batch
-- Sample-accurate cue extraction, duration-drift correction, 5 ms edge fades, silent full-length stems, and a browser-local 48 kHz / 24-bit master
+- Sample-accurate cue extraction, zero-padding/boundary trimming, 5 ms micro-fades, silent full-length stems, and an engine-rendered 48 kHz / 24-bit master
+- LUFS normalization and oversampled −1 dBFS true-peak protection without waveform interpolation
 - Failure isolation: one failed speaker does not discard successful tracks
 - Model cache and trust boundary: HTTPS host allowlisting with optional HMAC-signed IDs/checksums, redirect/DNS checks, size ceilings, safe archive extraction, SHA-256 object storage, and PyTorch weights-only preflight
 - A development copy backend so the entire upload → poll → download → merge flow can be tested without a GPU or model
 
-The speaker draft is a guess, not full diarization. Music, effects, crosstalk, and similar voices can confuse it; human review is intentionally part of the workflow.
+Silero decides where speech exists; the Voice A–F assignment is still a lightweight acoustic guess, not identity recognition or full diarization. Crosstalk and similar voices can confuse it, so human review is intentionally part of the workflow.
 
 ## Easiest local run
 
@@ -31,6 +33,8 @@ docker compose up --build
 ```
 
 3. Open `http://localhost:3000`. Only the VoiceMerge interface is exposed; the Python worker stays on Docker's private network.
+
+The first upload runs vocal separation before the review timeline appears. Demucs and Silero weights are cached in the image during the build, so this stage does not download models at runtime.
 
 The default compose file runs on CPU when no compatible GPU is visible. NVIDIA users with the Container Toolkit installed can enable CUDA:
 
@@ -71,10 +75,13 @@ pnpm build
 ## Engine API
 
 - `GET /api/v1/health`
-- `POST /api/v1/jobs` as multipart form data with `audio_file` and JSON `job_data`
+- `POST /api/v1/analyze` with multipart `audio_file`; returns the reusable `job_id`, speech cues, duration, and speech coverage
+- `POST /api/v1/convert` with the `job_id`, reviewed speaker timeline, model IDs, and RVC parameters
 - `GET /api/v1/jobs/{job_id}` for progress and track URLs
-- `GET /api/v1/jobs/{job_id}/tracks/{speaker_id}.wav`
+- `GET /api/v1/jobs/{job_id}/tracks/{track_name}` for `master.wav`, `background.wav`, or a speaker WAV
 - `DELETE /api/v1/jobs/{job_id}` after the tracks are downloaded
+
+The older multipart `POST /api/v1/jobs` route remains as a compatibility shim. It now runs separation and VAD before conversion too; mixed soundtrack audio is never sent directly to RVC.
 
 The browser calls `/api/engine/*`; the web app proxies that to `RVC_ENGINE_URL` and injects the private engine token. Set `VOICEMERGE_MODEL_HOSTS` to the smallest host allowlist you need. Production model registries can additionally issue `v1.<payload>.<hmac>` model IDs containing an expiry, allowlisted URL, and optional SHA-256.
 
@@ -84,9 +91,9 @@ The web interface can run on Sites or any compatible JavaScript host. RVC requir
 
 ## Privacy
 
-- Speaker analysis happens in the browser.
-- Source audio reaches only the configured VoiceMerge engine after **Convert all + merge** is clicked.
-- Completed tracks are fetched back into the browser; server job files expire and can be deleted immediately.
+- Source audio reaches the configured VoiceMerge engine when it is uploaded for local Demucs/Silero analysis.
+- The engine keeps the isolated stems under an opaque job ID and accepts conversion cues only inside the detected speech regions.
+- Completed tracks are fetched back into the browser; server job files expire automatically and can also be deleted through the API.
 - No personal account IDs, local paths, API keys, analytics keys, deployment identifiers, user audio, or model cache files belong in this repository.
 - `.env*`, `.openai/hosting.json`, build output, local jobs, and Python environments are ignored.
 

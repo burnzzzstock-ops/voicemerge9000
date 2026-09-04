@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from engine.audio import apply_edge_fades, assemble_speaker_stem, extract_cue, fit_to_samples
+from engine.audio import apply_edge_fades, assemble_speaker_stem, extract_cue, pad_or_trim_clip
 
 
 def test_extract_cue_uses_sample_accurate_bounds() -> None:
@@ -13,12 +13,12 @@ def test_extract_cue_uses_sample_accurate_bounds() -> None:
     assert cue[-1] == 455
 
 
-def test_fit_to_samples_corrects_duration_drift() -> None:
+def test_pad_or_trim_does_not_resample_audio() -> None:
     source = np.linspace(-0.5, 0.5, 93, dtype=np.float32)
-    fitted = fit_to_samples(source, 100)
+    fitted = pad_or_trim_clip(source, 100)
     assert len(fitted) == 100
-    assert np.isclose(fitted[0], source[0])
-    assert np.isclose(fitted[-1], source[-1])
+    np.testing.assert_array_equal(fitted[:93], source)
+    np.testing.assert_array_equal(fitted[93:], np.zeros(7, dtype=np.float32))
 
 
 def test_edge_fades_remove_boundary_clicks() -> None:
@@ -30,7 +30,7 @@ def test_edge_fades_remove_boundary_clicks() -> None:
 
 def test_assemble_stem_preserves_silence_and_timeline_length() -> None:
     cue = np.full(100, 0.25, dtype=np.float32)
-    stem = assemble_speaker_stem(1000, 1000, [(200, 300, cue), (600, 700, cue)])
+    stem = assemble_speaker_stem([(200, 300, cue), (600, 700, cue)], 1000, 1000)
     assert len(stem) == 1000
     assert np.all(stem[:200] == 0)
     assert np.any(stem[200:300] != 0)

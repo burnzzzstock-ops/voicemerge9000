@@ -53,7 +53,15 @@ type Speaker = {
   gain: number;
 };
 type Segment = { id: string; start: number; end: number; speakerId: string; confidence: number };
-type AnalysisResult = { buffer: AudioBuffer; duration: number; peaks: number[]; segments: Segment[] };
+type AnalysisResult = {
+  jobId: string;
+  buffer: AudioBuffer;
+  duration: number;
+  sampleRate: number;
+  speechCoverage: number;
+  peaks: number[];
+  segments: Segment[];
+};
 type EngineHealth = {
   state: 'checking' | 'ready' | 'offline';
   backend?: string;
@@ -62,7 +70,7 @@ type EngineHealth = {
 };
 type EngineJob = {
   job_id: string;
-  status: 'queued' | 'processing' | 'completed' | 'failed';
+  status: 'queued' | 'processing' | 'analyzed' | 'completed' | 'failed';
   progress: number;
   tracks: Record<string, string>;
   speaker_errors: Record<string, string>;
@@ -148,9 +156,10 @@ function jobProgressLabel(job: EngineJob, speakers: Speaker[]) {
   if (job.stage === 'extracting_model') return `Unpacking ${voice} model`;
   if (job.stage === 'validating_model') return `Safety-checking ${voice} model`;
   if (job.stage === 'resolving_model') return `Connecting to ${voice} model`;
-  if (job.stage === 'converting_audio') return `Converting ${voice} on the GPU`;
-  if (job.stage === 'assembling_track') return `Restoring ${voice} to the scene timeline`;
-  if (job.stage === 'preparing_audio') return 'Reading and preparing the scene audio';
+  if (job.stage === 'converting_speech') return `Converting ${voice} on the GPU`;
+  if (job.stage === 'assembling_speaker_stem') return `Restoring ${voice} to the scene timeline`;
+  if (job.stage === 'preparing_vocals') return 'Reading the isolated speech track';
+  if (job.stage === 'mixing_master') return 'Combining voices with the stereo background';
   return `Converting the cast · ${Math.round(job.progress * 100)}%`;
 }
 
@@ -166,12 +175,6 @@ function safeHttpUrl(value: string) {
 function replaceAudio(file: File, current?: LocalAudio) {
   if (current) URL.revokeObjectURL(current.url);
   return { file, url: URL.createObjectURL(file) };
-}
-
-function getPercentile(values: number[], fraction: number) {
-  if (!values.length) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))];
 }
 
 function segmentFeatures(data: Float32Array, sampleRate: number, start: number, end: number) {
@@ -235,58 +238,54 @@ function clusterSegments(features: number[][], count: number) {
   return assignments;
 }
 
-async function analyzeScene(file: File, speakers: Speaker[], sensitivity = 1): Promise<AnalysisResult> {
+function monoSamples(buffer: AudioBuffer) {
+  const mono = new Float32Array(buffer.length);
+  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+    const data = buffer.getChannelData(channel);
+    for (let index = 0; index < data.length; index += 1) mono[index] += data[index] / buffer.numberOfChannels;
+  }
+  return mono;
+}
+
+function assignSegments(buffer: AudioBuffer, regions: Array<{ id: string; start: number; end: number }>, speakers: Speaker[]) {
+  const mono = monoSamples(buffer);
+  const features = regions.map((region) => segmentFeatures(mono, buffer.sampleRate, region.start, region.end));
+  const assignments = clusterSegments(features, speakers.length);
+  return regions.map((region, index) => ({
+    ...region,
+    speakerId: speakers[assignments[index] ?? 0].id,
+    confidence: Math.max(0.46, Math.min(0.89, 0.62 + features[index][0] * 1.8)),
+  }));
+}
+
+async function analyzeScene(file: File, speakers: Speaker[]): Promise<AnalysisResult> {
   const decoder = new AudioContext();
   try {
-    const buffer = await decoder.decodeAudioData(await file.arrayBuffer());
-    const sampleRate = buffer.sampleRate;
-    const mono = new Float32Array(buffer.length);
-    for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
-      const data = buffer.getChannelData(channel);
-      for (let index = 0; index < data.length; index += 1) mono[index] += data[index] / buffer.numberOfChannels;
+    const form = new FormData();
+    form.append('audio_file', file, file.name);
+    const [buffer, response] = await Promise.all([
+      decoder.decodeAudioData(await file.arrayBuffer()),
+      fetch('/api/engine/analyze', { method: 'POST', body: form }),
+    ]);
+    const payload = await response.json() as {
+      job_id?: string;
+      duration_ms?: number;
+      sample_rate?: number;
+      speech_coverage?: number;
+      cues?: Array<{ cue_id: string; start_ms: number; end_ms: number }>;
+      error?: string;
+      detail?: string;
+    };
+    if (!response.ok || !payload.job_id || !payload.cues) {
+      throw new Error(payload.error || payload.detail || 'The local engine could not analyze this scene.');
     }
-
-    const frameSeconds = 0.08;
-    const frameSize = Math.max(256, Math.floor(sampleRate * frameSeconds));
-    const energy: number[] = [];
-    for (let from = 0; from < mono.length; from += frameSize) {
-      let sum = 0;
-      const to = Math.min(mono.length, from + frameSize);
-      for (let index = from; index < to; index += 4) sum += mono[index] * mono[index];
-      energy.push(Math.sqrt(sum / Math.max(1, Math.ceil((to - from) / 4))));
-    }
-
-    const noise = getPercentile(energy, 0.2);
-    const voice = getPercentile(energy, 0.72);
-    const threshold = Math.max(0.006, noise + (voice - noise) * (0.3 / sensitivity));
-    const raw: Array<{ start: number; end: number }> = [];
-    let activeStart = -1;
-    energy.forEach((value, index) => {
-      const active = value >= threshold;
-      if (active && activeStart < 0) activeStart = index;
-      if ((!active || index === energy.length - 1) && activeStart >= 0) {
-        raw.push({ start: activeStart * frameSeconds, end: Math.min(buffer.duration, (index + 1) * frameSeconds) });
-        activeStart = -1;
-      }
-    });
-
-    const merged: Array<{ start: number; end: number }> = [];
-    raw.forEach((region) => {
-      const previous = merged.at(-1);
-      if (previous && region.start - previous.end < 0.34) previous.end = region.end;
-      else merged.push({ ...region });
-    });
-    let regions = merged.filter((region) => region.end - region.start >= 0.24);
-    if (!regions.length) regions = [{ start: 0, end: buffer.duration }];
-
-    const features = regions.map((region) => segmentFeatures(mono, sampleRate, region.start, region.end));
-    const assignments = clusterSegments(features, speakers.length);
-    const segments = regions.map((region, index) => ({
-      id: `segment-${Date.now()}-${index}`,
-      ...region,
-      speakerId: speakers[assignments[index] ?? 0].id,
-      confidence: Math.max(0.46, Math.min(0.89, 0.62 + features[index][0] * 1.8)),
+    const regions = payload.cues.map((cue) => ({
+      id: cue.cue_id,
+      start: cue.start_ms / 1000,
+      end: cue.end_ms / 1000,
     }));
+    const segments = assignSegments(buffer, regions, speakers);
+    const mono = monoSamples(buffer);
 
     const peakCount = 180;
     const peakSize = Math.max(1, Math.floor(mono.length / peakCount));
@@ -300,47 +299,18 @@ async function analyzeScene(file: File, speakers: Speaker[], sensitivity = 1): P
       return peak;
     });
 
-    return { buffer, duration: buffer.duration, peaks, segments };
+    return {
+      jobId: payload.job_id,
+      buffer,
+      duration: (payload.duration_ms ?? Math.round(buffer.duration * 1000)) / 1000,
+      sampleRate: payload.sample_rate ?? 48_000,
+      speechCoverage: payload.speech_coverage ?? 0,
+      peaks,
+      segments,
+    };
   } finally {
     await decoder.close();
   }
-}
-
-function audioBufferTo24BitWav(buffer: AudioBuffer) {
-  const channels = Math.min(2, buffer.numberOfChannels);
-  const blockAlign = channels * 3;
-  const output = new ArrayBuffer(44 + buffer.length * blockAlign);
-  const view = new DataView(output);
-  const write = (offset: number, value: string) => {
-    for (let index = 0; index < value.length; index += 1) view.setUint8(offset + index, value.charCodeAt(index));
-  };
-  write(0, 'RIFF');
-  view.setUint32(4, output.byteLength - 8, true);
-  write(8, 'WAVE');
-  write(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, channels, true);
-  view.setUint32(24, buffer.sampleRate, true);
-  view.setUint32(28, buffer.sampleRate * blockAlign, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 24, true);
-  write(36, 'data');
-  view.setUint32(40, output.byteLength - 44, true);
-  const data = Array.from({ length: channels }, (_, channel) => buffer.getChannelData(channel));
-  let offset = 44;
-  for (let sample = 0; sample < buffer.length; sample += 1) {
-    for (let channel = 0; channel < channels; channel += 1) {
-      const input = Math.max(-1, Math.min(1, data[channel][sample]));
-      let value = input < 0 ? Math.round(input * 8388608) : Math.round(input * 8388607);
-      if (value < 0) value += 16777216;
-      view.setUint8(offset, value & 255);
-      view.setUint8(offset + 1, (value >> 8) & 255);
-      view.setUint8(offset + 2, (value >> 16) & 255);
-      offset += 3;
-    }
-  }
-  return new Blob([output], { type: 'audio/wav' });
 }
 
 function UploadScene({ value, busy, onFile }: { value?: LocalAudio; busy: boolean; onFile: (file: File) => void }) {
@@ -359,8 +329,8 @@ function UploadScene({ value, busy, onFile }: { value?: LocalAudio; busy: boolea
       />
       <span className="drop-icon">{busy ? <LoaderCircle className="spin" /> : value ? <Check /> : <Upload />}</span>
       <span className="min-w-0 flex-1">
-        <strong>{busy ? 'Finding the dialogue…' : value ? value.file.name : 'Drop in the movie, scene, or song MP3'}</strong>
-        <small>{value ? `${formatBytes(value.file.size)} · never uploaded for analysis` : 'We make a local first-pass speaker map. You approve it.'}</small>
+        <strong>{busy ? 'Separating vocals + finding speech…' : value ? value.file.name : 'Drop in the movie, scene, or song MP3'}</strong>
+        <small>{value ? `${formatBytes(value.file.size)} · analyzed by your configured engine` : 'We isolate speech, then make a speaker draft for you to approve.'}</small>
       </span>
       <span className="drop-action">{value ? 'Replace' : 'Choose MP3'}</span>
     </label>
@@ -463,13 +433,13 @@ export default function VoiceCastStudio() {
     return () => lifecycle.abort();
   }, []);
 
-  async function runAnalysis(file: File, nextSpeakers = speakers, sensitivity = 1) {
+  async function runAnalysis(file: File, nextSpeakers = speakers) {
     setAnalyzing(true);
     setAnalysisError('');
     try {
-      setAnalysis(await analyzeScene(file, nextSpeakers, sensitivity));
+      setAnalysis(await analyzeScene(file, nextSpeakers));
     } catch (error) {
-      setAnalysisError(error instanceof Error ? error.message : 'This browser could not read that audio file.');
+      setAnalysisError(error instanceof Error ? error.message : 'The local engine could not analyze that audio file.');
     } finally {
       setAnalyzing(false);
     }
@@ -477,7 +447,11 @@ export default function VoiceCastStudio() {
 
   function chooseScene(file: File) {
     const next = replaceAudio(file, scene);
+    if (mix) URL.revokeObjectURL(mix.url);
     setScene(next);
+    setAnalysis(undefined);
+    setMix(undefined);
+    setEngineJob(undefined);
     setSpeakers((current) => current.map((speaker) => ({ ...speaker, converted: undefined })));
     setConversionState('idle');
     setMixState('idle');
@@ -490,7 +464,14 @@ export default function VoiceCastStudio() {
     setConversionState('idle');
     setMixState('idle');
     if (!next.some((speaker) => speaker.id === activeSpeakerId)) setActiveSpeakerId(next[0].id);
-    if (scene) void runAnalysis(scene.file, next);
+    setAnalysis((current) => current && {
+      ...current,
+      segments: assignSegments(
+        current.buffer,
+        current.segments.map(({ id, start, end }) => ({ id, start, end })),
+        next,
+      ),
+    });
   }
 
   async function searchModels(event?: SyntheticEvent<HTMLFormElement>) {
@@ -562,72 +543,18 @@ export default function VoiceCastStudio() {
     setPromptReply(`Split the section at ${formatTime(playhead)}.`);
   }
 
-  async function renderMix(speakerReturns = usedSpeakers) {
-    if (!analysis || !scene || !speakerReturns.length || !speakerReturns.every((speaker) => speaker.converted)) return;
-    setMixState('working');
-    setMixError('');
-    const decoder = new AudioContext();
-    try {
-      const returns = await Promise.all(speakerReturns.map(async (speaker) => ({
-        speaker,
-        buffer: await decoder.decodeAudioData(await speaker.converted!.file.arrayBuffer()),
-      })));
-      const sampleRate = 48000;
-      const offline = new OfflineAudioContext(2, Math.ceil(analysis.duration * sampleRate), sampleRate);
-      const master = offline.createGain();
-      const limiter = offline.createDynamicsCompressor();
-      limiter.threshold.value = -3;
-      limiter.knee.value = 5;
-      limiter.ratio.value = 16;
-      limiter.attack.value = 0.003;
-      limiter.release.value = 0.13;
-      master.connect(limiter).connect(offline.destination);
-
-      const bed = offline.createBufferSource();
-      const bedGain = offline.createGain();
-      bed.buffer = analysis.buffer;
-      bedGain.gain.setValueAtTime(1, 0);
-      [...analysis.segments].sort((a, b) => a.start - b.start).forEach((segment) => {
-        bedGain.gain.setValueAtTime(1, Math.max(0, segment.start - 0.06));
-        bedGain.gain.linearRampToValueAtTime(0.16, segment.start + 0.02);
-        bedGain.gain.setValueAtTime(0.16, Math.max(segment.start + 0.02, segment.end - 0.03));
-        bedGain.gain.linearRampToValueAtTime(1, Math.min(analysis.duration, segment.end + 0.08));
-      });
-      bed.connect(bedGain).connect(master);
-      bed.start(0);
-
-      returns.forEach(({ speaker, buffer }) => {
-        const source = offline.createBufferSource();
-        const gain = offline.createGain();
-        source.buffer = buffer;
-        gain.gain.value = speaker.gain;
-        source.connect(gain).connect(master);
-        source.start(0);
-      });
-
-      const rendered = await offline.startRendering();
-      const next = { url: URL.createObjectURL(audioBufferTo24BitWav(rendered)), duration: analysis.duration };
-      if (mix) URL.revokeObjectURL(mix.url);
-      setMix(next);
-      setMixState('done');
-    } catch (error) {
-      setMixError(error instanceof Error ? error.message : 'The browser could not merge those files.');
-      setMixState('error');
-    } finally {
-      await decoder.close();
-    }
-  }
-
   async function convertAndMerge() {
     if (!analysis || !scene || !modelsReady || engineHealth.state !== 'ready') return;
     setConversionState('working');
     setConversionError('');
     setMixError('');
+    setMixState('working');
     setEngineJob(undefined);
     try {
       const timeline = usedSpeakers.map((speaker) => ({
         speaker_id: speaker.id,
         model_id: speaker.model!.downloadUrl,
+        gain: speaker.gain,
         cues: analysis.segments
           .filter((segment) => segment.speakerId === speaker.id)
           .sort((a, b) => a.start - b.start)
@@ -637,10 +564,15 @@ export default function VoiceCastStudio() {
             end_ms: Math.min(Math.round(analysis.duration * 1000), Math.round(segment.end * 1000)),
           })),
       }));
-      const form = new FormData();
-      form.append('audio_file', scene.file, scene.file.name);
-      form.append('job_data', JSON.stringify({ timeline, params: { pitch: 0, f0_method: 'rmvpe', index_rate: 0.75 } }));
-      const response = await fetch('/api/engine/jobs', { method: 'POST', body: form });
+      const response = await fetch('/api/engine/convert', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          job_id: analysis.jobId,
+          timeline,
+          params: { pitch: 0, f0_method: 'rmvpe', index_rate: 0.75 },
+        }),
+      });
       const created = await response.json() as { job_id?: string; error?: string; detail?: string };
       if (!response.ok || !created.job_id) throw new Error(created.error || created.detail || 'The conversion job could not start.');
 
@@ -668,21 +600,24 @@ export default function VoiceCastStudio() {
       const returnedById = new Map(returned.map((speaker) => [speaker.id, speaker]));
       const nextSpeakers = speakers.map((speaker) => returnedById.get(speaker.id) ?? speaker);
       setSpeakers(nextSpeakers);
-      const completeReturns = usedSpeakers.map((speaker) => returnedById.get(speaker.id) ?? speaker);
       const failures = Object.entries(job.speaker_errors ?? {});
-      if (completeReturns.every((speaker) => speaker.converted)) {
-        await renderMix(completeReturns);
-        setConversionState('done');
-      } else {
-        setConversionState('error');
-        throw new Error(failures.length
-          ? failures.map(([speakerId, message]) => `${speakerId}: ${message}`).join(' · ')
-          : job.error || 'One or more speaker tracks failed. Successful tracks are still available below.');
+      const masterTrack = job.tracks.master;
+      if (!masterTrack) throw new Error(job.error || 'The engine did not produce a final master.');
+      const masterResponse = await fetch(engineTrackUrl(masterTrack));
+      if (!masterResponse.ok) throw new Error('The final master could not be downloaded.');
+      const masterBlob = await masterResponse.blob();
+      const nextMix = { url: URL.createObjectURL(masterBlob), duration: analysis.duration };
+      if (mix) URL.revokeObjectURL(mix.url);
+      setMix(nextMix);
+      setMixState('done');
+      setConversionState(failures.length ? 'error' : 'done');
+      if (failures.length) {
+        setConversionError(failures.map(([speakerId, message]) => `${speakerId}: ${message}`).join(' · '));
       }
-      void fetch(`/api/engine/jobs/${created.job_id}`, { method: 'DELETE' });
     } catch (error) {
       setConversionError(error instanceof Error ? error.message : 'The integrated voice conversion failed.');
       setConversionState('error');
+      setMixState('error');
     }
   }
 
@@ -707,19 +642,17 @@ export default function VoiceCastStudio() {
       const index = level[1].charCodeAt(0) - 97;
       const delta = level[2] === 'louder' ? 0.12 : -0.12;
       setSpeakers((current) => current.map((speaker, speakerIndex) => speakerIndex === index
-        ? { ...speaker, gain: Math.max(0.25, Math.min(1.75, speaker.gain + delta)) } : speaker));
+        ? { ...speaker, gain: Math.max(0.25, Math.min(1.75, speaker.gain + delta)), converted: undefined } : speaker));
+      setConversionState('idle');
+      setMixState('idle');
       setPromptReply(`Adjusted voice ${level[1].toUpperCase()} by ${delta > 0 ? '+' : ''}${Math.round(delta * 100)}%.`);
     } else if (count) {
       changeSpeakerCount(Number(count[1]));
       setPromptReply(`Rebuilding the draft for ${count[1]} speakers.`);
-    } else if (/more sensitive|find more|missed dialogue/.test(text) && scene) {
-      void runAnalysis(scene.file, speakers, 1.28);
-      setPromptReply('Running a more sensitive dialogue pass. Review the extra sections.');
-    } else if (/conservative|less sensitive|fewer sections/.test(text) && scene) {
-      void runAnalysis(scene.file, speakers, 0.78);
-      setPromptReply('Running a more conservative dialogue pass.');
+    } else if (/split|cut here|new section/.test(text)) {
+      splitAtPlayhead();
     } else {
-      setPromptReply('Try “swap A and B”, “make B louder”, “use 4 speakers”, or “find more dialogue”.');
+      setPromptReply('Try “swap A and B”, “make B louder”, “use 4 speakers”, or “split at playhead”.');
     }
     setPrompt('');
   }
@@ -771,7 +704,7 @@ export default function VoiceCastStudio() {
           <div className="section-heading between">
             <div className="flex items-center gap-4">
               <span className="section-number">02</span>
-              <div><p className="eyebrow">LOCAL AUTO-DRAFT</p><h2>Check who talks where</h2></div>
+            <div><p className="eyebrow">ISOLATED SPEECH DRAFT</p><h2>Check who talks where</h2></div>
             </div>
             <label className="speaker-count">Expected voices
               <select value={speakers.length} onChange={(event) => changeSpeakerCount(Number(event.target.value))}>
@@ -784,7 +717,7 @@ export default function VoiceCastStudio() {
             <div className="empty-stage"><WandSparkles /><strong>Your speaker map appears here</strong><span>Upload an MP3 above to start.</span></div>
           ) : (
             <>
-              <div className="review-note"><Sparkles /> This is a fast acoustic guess, not identity recognition. Click any wrong label and fix it before converting.</div>
+              <div className="review-note"><Sparkles /> Demucs removed the background and Silero found the speech. Speaker labels are still an acoustic guess—click any wrong one before converting.</div>
               <div className="timeline">
                 <button className="timeline-seek" aria-label="Audio timeline. Click to move the playhead." onKeyDown={(event) => {
                   if (event.key === 'ArrowLeft' && audioRef.current) audioRef.current.currentTime = Math.max(0, audioRef.current.currentTime - 1);
@@ -809,7 +742,7 @@ export default function VoiceCastStudio() {
                 <i className="playhead" style={{ left: `${(playhead / analysis.duration) * 100}%` }} />
               </div>
               <div className="speaker-legend">{speakers.map((speaker) => <span key={speaker.id}><i style={{ background: speaker.color }} />{speaker.label}</span>)}</div>
-              <div className="segment-toolbar"><span>{analysis.segments.length} dialogue sections · {formatTime(analysis.duration)} total</span><Button variant="outline" size="sm" onClick={splitAtPlayhead}><Split />Split at playhead</Button></div>
+              <div className="segment-toolbar"><span>{analysis.segments.length} speech sections · {Math.round(analysis.speechCoverage * 100)}% dialogue coverage · {formatTime(analysis.duration)} total</span><Button variant="outline" size="sm" onClick={splitAtPlayhead}><Split />Split at playhead</Button></div>
               <div className="segment-list">
                 {analysis.segments.map((segment, index) => {
                   const speaker = speakers.find((item) => item.id === segment.speakerId) ?? speakers[0];
@@ -915,7 +848,7 @@ export default function VoiceCastStudio() {
           </div>
           {conversionState === 'working' ? <div className="conversion-progress" aria-live="polite">
             <div><span style={{ width: `${Math.max(2, (engineJob?.progress ?? 0.02) * 100)}%` }} /></div>
-            <p>{engineJob?.status === 'processing' ? jobProgressLabel(engineJob, speakers) : 'Uploading the reviewed scene…'}</p>
+            <p>{engineJob?.status === 'processing' ? jobProgressLabel(engineJob, speakers) : 'Starting the reviewed conversion…'}</p>
           </div> : null}
           <div className="merge-strip">
             <div><p className="eyebrow">FINAL MASTER</p><strong>{!usedSpeakers.length
@@ -940,12 +873,12 @@ export default function VoiceCastStudio() {
               <Input value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Try: swap A and B, make B louder, use 4 speakers…" />
               <Button type="submit"><Sparkles /> Apply</Button>
             </form>
-            <div className="suggestion-chips">{['Swap A and B', 'Make B louder', 'Use 4 speakers', 'Find more dialogue'].map((suggestion) => <button key={suggestion} onClick={() => applyPrompt(suggestion)}>{suggestion}</button>)}</div>
+            <div className="suggestion-chips">{['Swap A and B', 'Make B louder', 'Use 4 speakers', 'Split at playhead'].map((suggestion) => <button key={suggestion} onClick={() => applyPrompt(suggestion)}>{suggestion}</button>)}</div>
             {promptReply ? <p className="prompt-reply">{promptReply}</p> : null}
           </div>
         </section>
 
-        <footer>Open source · Local speaker analysis · Audio reaches only your configured VoiceMerge engine after you click convert · Use fictional, stylized, or authorized voices</footer>
+        <footer>Open source · Local Demucs + Silero analysis · Audio stays with your configured VoiceMerge engine · Use fictional, stylized, or authorized voices</footer>
       </div>
     </main>
   );

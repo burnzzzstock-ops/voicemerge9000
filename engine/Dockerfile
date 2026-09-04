@@ -30,18 +30,25 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 WORKDIR /app
 COPY engine/requirements.txt /app/engine/requirements.txt
+COPY engine/requirements-audio.txt /app/engine/requirements-audio.txt
 RUN pip install --no-cache-dir -r /app/engine/requirements.txt \
+    && /opt/rvc-venv/bin/pip install --no-cache-dir -r /app/engine/requirements-audio.txt \
     && cd /opt/rvc \
     && /opt/rvc-venv/bin/hf download lj1995/VoiceConversionWebUI --revision main \
        --include "hubert_base/*" --local-dir assets \
     && /opt/rvc-venv/bin/hf download lj1995/VoiceConversionWebUI rmvpe.pt --revision main \
        --local-dir assets/rmvpe
 
+ENV TORCH_HOME=/opt/audio-models/torch
+RUN mkdir -p "${TORCH_HOME}" \
+    && /opt/rvc-venv/bin/python -c "from demucs.pretrained import get_model; get_model('htdemucs')" \
+    && /opt/rvc-venv/bin/python -c "from silero_vad import load_silero_vad; load_silero_vad(onnx=True)"
+
 COPY engine /app/engine
 
 RUN useradd --create-home --uid 10001 voicemerge \
     && mkdir -p /var/lib/voicemerge/models /var/lib/voicemerge/jobs \
-    && chown -R voicemerge:voicemerge /var/lib/voicemerge /app /opt/rvc
+    && chown -R voicemerge:voicemerge /var/lib/voicemerge /app /opt/rvc /opt/audio-models
 
 USER voicemerge
 ENV PYTHONUNBUFFERED=1 \

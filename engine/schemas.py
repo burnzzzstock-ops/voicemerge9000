@@ -29,7 +29,15 @@ class CueSegment(StrictModel):
 class SpeakerTimeline(StrictModel):
     speaker_id: str = Field(pattern=ID_PATTERN)
     model_id: str = Field(min_length=1, max_length=4096)
+    gain: float = Field(default=1.0, ge=0.25, le=1.75)
     cues: list[CueSegment] = Field(min_length=1, max_length=10_000)
+
+    @field_validator("speaker_id")
+    @classmethod
+    def reject_reserved_track_names(cls, speaker_id: str) -> str:
+        if speaker_id.lower() in {"background", "master", "vocals"}:
+            raise ValueError("speaker_id is reserved for an engine track")
+        return speaker_id
 
     @field_validator("cues")
     @classmethod
@@ -65,7 +73,17 @@ class JobSubmission(StrictModel):
         return timeline
 
 
-JobStatus = Literal["queued", "processing", "completed", "failed"]
+class ConversionRequest(JobSubmission):
+    job_id: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
+class SpeechCueResult(StrictModel):
+    cue_id: str = Field(pattern=ID_PATTERN)
+    start_ms: int = Field(ge=0)
+    end_ms: int = Field(gt=0)
+
+
+JobStatus = Literal["queued", "processing", "analyzed", "completed", "failed"]
 
 
 class JobCreated(StrictModel):
@@ -84,6 +102,15 @@ class JobProgress(StrictModel):
     active_speaker: str | None = None
     downloaded_bytes: int | None = Field(default=None, ge=0)
     total_bytes: int | None = Field(default=None, ge=0)
+
+
+class AnalysisResponse(StrictModel):
+    job_id: str
+    status: Literal["analyzed"] = "analyzed"
+    duration_ms: int = Field(gt=0)
+    sample_rate: int = Field(gt=0)
+    speech_coverage: float = Field(ge=0, le=1)
+    cues: list[SpeechCueResult]
 
 
 class HealthResponse(StrictModel):
