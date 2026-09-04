@@ -11,6 +11,12 @@
 
 # testing
 /coverage
+/.venv/
+/.pytest_cache/
+/.local/
+__pycache__/
+*.py[cod]
+*.tsbuildinfo
 
 # next.js
 /.next/

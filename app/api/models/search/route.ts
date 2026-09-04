@@ -59,6 +59,7 @@ function parseResults(table: string) {
       downloadUrl: download.href,
       creator: creatorLink?.label || undefined,
       size,
+      engineReady: !/mega\.nz|mediafire\.com/i.test(download.href),
       sampleUrl: sampleReady && sampleName
         ? `https://s3.us-west-000.backblazeb2.com/bbvoe3/samples2/${encodeURIComponent(sampleName)}.mp3`
         : undefined,

@@ -1,0 +1,32 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    ports:
+      - "3000:3000"
+    environment:
+      RVC_ENGINE_URL: http://rvc-engine:8000
+      RVC_ENGINE_API_TOKEN: ${VOICEMERGE_API_TOKEN:-change-me}
+    depends_on:
+      rvc-engine:
+        condition: service_healthy
+
+  rvc-engine:
+    build:
+      context: .
+      dockerfile: engine/Dockerfile
+    expose:
+      - "8000"
+    environment:
+      VOICEMERGE_ENV: production
+      VOICEMERGE_API_TOKEN: ${VOICEMERGE_API_TOKEN:-change-me}
+      VOICEMERGE_ALLOWED_ORIGINS: ${VOICEMERGE_ALLOWED_ORIGINS:-http://localhost:3000}
+      VOICEMERGE_MODEL_HOSTS: ${VOICEMERGE_MODEL_HOSTS:-huggingface.co,hf.co,drive.google.com,drive.usercontent.google.com,googleusercontent.com,pixeldrain.com,mediafire.com,weights.gg,voice-models.com}
+    volumes:
+      - rvc-models:/var/lib/voicemerge/models
+      - rvc-jobs:/var/lib/voicemerge/jobs
+
+volumes:
+  rvc-models:
+  rvc-jobs:

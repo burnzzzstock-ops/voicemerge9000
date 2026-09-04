@@ -1,12 +1,18 @@
 import { sites } from '@openai/sites-vite-plugin';
 import tailwindcss from '@tailwindcss/postcss';
+import { readFileSync } from 'node:fs';
 import vinext from 'vinext';
 import { defineConfig } from 'vite';
-import hostingConfig from './.openai/hosting.json';
 
 const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
   '00000000-0000-4000-8000-000000000000';
 
+let hostingConfig: { d1?: string | null; r2?: string | null } = {};
+try {
+  hostingConfig = JSON.parse(readFileSync(new URL('./.openai/hosting.json', import.meta.url), 'utf8'));
+} catch {
+  // A clean GitHub checkout has no private Sites binding and still builds locally.
+}
 const { d1, r2 } = hostingConfig;
 
 // macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
@@ -15,6 +21,10 @@ const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === 'seatbelt';
 const localBindingConfig = {
   main: 'vinext/server/fetch-handler',
   compatibility_flags: ['nodejs_compat'],
+  vars: {
+    RVC_ENGINE_URL: process.env.RVC_ENGINE_URL ?? '',
+    RVC_ENGINE_API_TOKEN: process.env.RVC_ENGINE_API_TOKEN ?? '',
+  },
   d1_databases: d1
     ? [
         {
