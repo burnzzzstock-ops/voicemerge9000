@@ -1,7 +1,7 @@
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG RVC_REF=2.3.260718
+ARG RVC_REF=81eed5e8f68b6bed1789f682fe78cdd324495afc
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl ffmpeg git libsndfile1 python3 python3-pip python3-venv \
@@ -10,14 +10,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python3 -m venv /opt/rvc-venv && python3 -m venv /opt/api-venv
 ENV PATH="/opt/api-venv/bin:${PATH}"
 
-RUN git clone --filter=blob:none --branch "${RVC_REF}" --depth 1 \
-    https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git /opt/rvc \
-    && /opt/rvc-venv/bin/pip install --no-cache-dir \
-       torch==2.7.1+cu128 torchaudio==2.7.1+cu128 \
-       --index-url https://download.pytorch.org/whl/cu128 \
-       --extra-index-url https://pypi.org/simple \
-    && /opt/rvc-venv/bin/pip install --no-cache-dir \
-       -r /opt/rvc/requirments_cu128_py312.txt huggingface_hub
+RUN git init /opt/rvc \
+    && git -C /opt/rvc remote add origin \
+       https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI.git \
+    && git -C /opt/rvc fetch --filter=blob:none --depth 1 origin "${RVC_REF}" \
+    && git -C /opt/rvc checkout --detach FETCH_HEAD \
+    && sed -i 's#https://mirrors.pku.edu.cn/pypi/simple#https://pypi.org/simple#g' \
+       /opt/rvc/requirments_cu128_py312.txt
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /opt/rvc-venv/bin/pip install \
+    torch==2.7.1+cu128 torchaudio==2.7.1+cu128 \
+    --index-url https://download.pytorch.org/whl/cu128 \
+    --extra-index-url https://pypi.org/simple
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /opt/rvc-venv/bin/pip install \
+    -r /opt/rvc/requirments_cu128_py312.txt huggingface_hub
 
 WORKDIR /app
 COPY engine/requirements.txt /app/engine/requirements.txt
