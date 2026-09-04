@@ -239,7 +239,7 @@ footer { padding: 24px 2px 0; color: oklch(1 0 0 / .21); font-size: 8px; text-al
   .cast-layout { grid-template-columns: 1fr; }
   .speaker-stack { display: grid; grid-template-columns: repeat(3, 1fr); }
   .job-card { grid-template-columns: 38px 1fr; }
-  .job-status { justify-self: start; }
+  .job-status { grid-column: 2; justify-self: start; }
   .model-results article { grid-template-columns: minmax(180px, 1fr) 130px 26px; }
   .model-results article button { grid-column: 1 / -1; width: 100%; }
 }

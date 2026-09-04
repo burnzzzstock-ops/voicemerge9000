@@ -89,7 +89,7 @@ class RVCEngine:
         self.ready()
         command = [
             self.settings.python,
-            str(self.settings.root / "infer" / "cli.py"),
+            "-m", "infer.cli",
             "--model", str(model.checkpoint),
             "--input", str(input_directory),
             "--output", str(output_directory),
