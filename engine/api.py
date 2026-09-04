@@ -41,6 +41,10 @@ class JobRecord:
     tracks: dict[str, str] = field(default_factory=dict)
     speaker_errors: dict[str, str] = field(default_factory=dict)
     error: str | None = None
+    stage: str | None = "queued"
+    active_speaker: str | None = None
+    downloaded_bytes: int | None = None
+    total_bytes: int | None = None
     created_at: float = field(default_factory=time.time)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -53,6 +57,10 @@ class JobRecord:
                 tracks=dict(self.tracks),
                 speaker_errors=dict(self.speaker_errors),
                 error=self.error,
+                stage=self.stage,
+                active_speaker=self.active_speaker,
+                downloaded_bytes=self.downloaded_bytes,
+                total_bytes=self.total_bytes,
             )
 
 
@@ -106,6 +114,7 @@ def process_job(record: JobRecord) -> None:
     with record.lock:
         record.status = "processing"
         record.progress = 0.01
+        record.stage = "preparing_audio"
     transient = record.directory / "work"
     tracks_directory = record.directory / "tracks"
     transient.mkdir(exist_ok=True)
@@ -118,8 +127,22 @@ def process_job(record: JobRecord) -> None:
         metadata = inspect_audio(audio_path)
         master, sample_rate = read_audio_mono(audio_path)
         for speaker in record.submission.timeline:
+            speaker_units = len(speaker.cues)
+            base_progress = min(0.96, completed_units / max(1, total_units) * 0.94 + 0.02)
+            speaker_span = speaker_units / max(1, total_units) * 0.94
+
+            def report_model_progress(stage: str, downloaded: int | None, total: int | None) -> None:
+                with record.lock:
+                    record.stage = stage
+                    record.active_speaker = speaker.speaker_id
+                    record.downloaded_bytes = downloaded
+                    record.total_bytes = total
+                    if stage == "downloading_model" and downloaded is not None and total:
+                        fraction = min(1, downloaded / total)
+                        record.progress = max(record.progress, min(0.95, base_progress + speaker_span * 0.2 * fraction))
+
             try:
-                model = development_model() if engine.backend == "copy" else model_store.resolve(speaker.model_id)
+                model = development_model() if engine.backend == "copy" else model_store.resolve(speaker.model_id, report_model_progress)
                 speaker_work = transient / speaker.speaker_id
                 inputs = speaker_work / "inputs"
                 outputs = speaker_work / "outputs"
@@ -131,6 +154,12 @@ def process_job(record: JobRecord) -> None:
                     cue_input = inputs / f"{cue.cue_id}.wav"
                     write_pcm24_wav(cue_input, master[start:end], sample_rate)
                     sources.append(cue_input)
+                with record.lock:
+                    record.stage = "converting_audio"
+                    record.active_speaker = speaker.speaker_id
+                    record.downloaded_bytes = None
+                    record.total_bytes = None
+                    record.progress = max(record.progress, min(0.95, base_progress + speaker_span * 0.2))
                 with gpu_slot:
                     converted_files = engine.convert_batch(sources, outputs, model, record.submission.params)
                 converted_cues: list[tuple[int, int, np.ndarray]] = []
@@ -140,6 +169,8 @@ def process_job(record: JobRecord) -> None:
                     completed_units += 1
                     with record.lock:
                         record.progress = min(0.96, completed_units / max(1, total_units) * 0.94 + 0.02)
+                with record.lock:
+                    record.stage = "assembling_track"
                 stem = assemble_speaker_stem(metadata.frames, sample_rate, converted_cues)
                 track_path = tracks_directory / f"{speaker.speaker_id}.wav"
                 write_pcm24_wav(track_path, stem, sample_rate)
@@ -147,7 +178,7 @@ def process_job(record: JobRecord) -> None:
                     record.tracks[speaker.speaker_id] = f"/api/v1/jobs/{record.job_id}/tracks/{speaker.speaker_id}.wav"
                 successful += 1
             except Exception as error:
-                completed_units += len(speaker.cues)
+                completed_units += speaker_units
                 with record.lock:
                     record.speaker_errors[speaker.speaker_id] = str(error)[:1000]
                     record.progress = min(0.96, completed_units / max(1, total_units) * 0.94 + 0.02)
@@ -155,15 +186,24 @@ def process_job(record: JobRecord) -> None:
             if successful:
                 record.status = "completed"
                 record.progress = 1
+                record.stage = "completed"
             else:
                 record.status = "failed"
                 record.progress = 1
                 record.error = "No speaker tracks could be converted."
+                record.stage = "failed"
+            record.active_speaker = None
+            record.downloaded_bytes = None
+            record.total_bytes = None
     except Exception as error:
         with record.lock:
             record.status = "failed"
             record.progress = 1
             record.error = str(error)[:1000]
+            record.stage = "failed"
+            record.active_speaker = None
+            record.downloaded_bytes = None
+            record.total_bytes = None
     finally:
         shutil.rmtree(transient, ignore_errors=True)
 

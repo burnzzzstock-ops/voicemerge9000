@@ -87,6 +87,21 @@ class RVCEngine:
                 outputs[source] = destination
             return outputs
         self.ready()
+        index_alias: Path | None = None
+        if model.index:
+            # The official CLI rewrites any supplied filename containing
+            # "trained" to "added" before checking that it exists. Community
+            # archives often include only the trained-named file, so expose the
+            # validated index through a stable alias that the CLI will accept.
+            index_alias = output_directory / ".voicemerge.index"
+            index_alias.unlink(missing_ok=True)
+            try:
+                os.link(model.index, index_alias)
+            except OSError:
+                try:
+                    index_alias.symlink_to(model.index)
+                except OSError:
+                    shutil.copyfile(model.index, index_alias)
         command = [
             self.settings.python,
             "-m", "infer.cli",
@@ -95,15 +110,15 @@ class RVCEngine:
             "--output", str(output_directory),
             "--pitch", str(params.pitch),
             "--f0-method", params.f0_method,
-            "--index-rate", str(params.index_rate if model.index else 0),
+            "--index-rate", str(params.index_rate if index_alias else 0),
             "--rms-mix-rate", str(params.rms_mix_rate),
             "--protect", str(params.protect),
             "--resample-sr", "0",
             "--format", "wav",
             "--overwrite",
         ]
-        if model.index:
-            command.extend(["--index", str(model.index)])
+        if index_alias:
+            command.extend(["--index", str(index_alias)])
         environment = {
             key: value for key, value in os.environ.items()
             if key in {"PATH", "PYTHONPATH", "CUDA_VISIBLE_DEVICES", "LD_LIBRARY_PATH", "HOME", "TEMP", "TMP", "TMPDIR"}
@@ -122,6 +137,8 @@ class RVCEngine:
         except subprocess.TimeoutExpired as error:
             raise RVCInferenceError("RVC conversion timed out") from error
         finally:
+            if index_alias:
+                index_alias.unlink(missing_ok=True)
             gc.collect()
         outputs = {source: output_directory / source.name for source in sources}
         if result.returncode or any(not destination.is_file() for destination in outputs.values()):

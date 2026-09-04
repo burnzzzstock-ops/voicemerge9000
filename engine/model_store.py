@@ -16,6 +16,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Callable
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -27,6 +28,9 @@ class ModelStoreError(RuntimeError):
 
 class ModelSecurityError(ModelStoreError):
     pass
+
+
+ModelProgress = Callable[[str, int | None, int | None], None]
 
 
 @dataclass(frozen=True)
@@ -152,7 +156,7 @@ class ModelStore:
         except (KeyError, ValueError, TypeError, json.JSONDecodeError) as error:
             raise ModelSecurityError("invalid model token") from error
 
-    def _download(self, url: str, destination: Path) -> None:
+    def _download(self, url: str, destination: Path, progress: ModelProgress | None = None) -> None:
         current = self._validate_remote_url(url)
         with httpx.Client(timeout=httpx.Timeout(30, read=300), follow_redirects=False) as client:
             for _ in range(6):
@@ -168,12 +172,18 @@ class ModelStore:
                     if declared > self.settings.max_download_bytes:
                         raise ModelSecurityError("model package exceeds the download limit")
                     size = 0
+                    if progress:
+                        progress("downloading_model", 0, declared or None)
                     with destination.open("wb") as target:
                         for chunk in response.iter_bytes(1024 * 1024):
                             size += len(chunk)
                             if size > self.settings.max_download_bytes:
                                 raise ModelSecurityError("model package exceeds the download limit")
                             target.write(chunk)
+                            if progress:
+                                progress("downloading_model", size, declared or None)
+                    if progress:
+                        progress("extracting_model", size, declared or size)
                     return
             raise ModelSecurityError("model URL redirected too many times")
 
@@ -203,6 +213,8 @@ class ModelStore:
                 if suffix not in {".pth", ".index"}:
                     continue
                 limit = self.settings.max_checkpoint_bytes if suffix == ".pth" else self.settings.max_index_bytes
+                if suffix == ".index" and not 1 <= member.file_size <= limit:
+                    continue
                 total += member.file_size
                 if total > self.settings.max_extracted_bytes:
                     raise ModelSecurityError("extracted model files exceed the limit")
@@ -225,6 +237,8 @@ class ModelStore:
                 if suffix not in {".pth", ".index"}:
                     continue
                 limit = self.settings.max_checkpoint_bytes if suffix == ".pth" else self.settings.max_index_bytes
+                if suffix == ".index" and not 1 <= member.size <= limit:
+                    continue
                 total += member.size
                 if total > self.settings.max_extracted_bytes:
                     raise ModelSecurityError("extracted model files exceed the limit")
@@ -253,7 +267,7 @@ class ModelStore:
             detail = (result.stderr or result.stdout).strip().splitlines()[-1:]
             raise ModelSecurityError(f"checkpoint failed weights-only validation{': ' + detail[0] if detail else ''}")
 
-    def resolve(self, model_id: str) -> ModelArtifact:
+    def resolve(self, model_id: str, progress: ModelProgress | None = None) -> ModelArtifact:
         url, expected_hash = self._decode_model_id(model_id)
         reference_key = hashlib.sha256(url.encode()).hexdigest()
         reference = self.settings.root / "refs" / f"{reference_key}.json"
@@ -264,6 +278,8 @@ class ModelStore:
                 checkpoint = object_root / metadata["checkpoint"]
                 index = object_root / metadata["index"] if metadata.get("index") else None
                 if checkpoint.is_file() and (index is None or index.is_file()):
+                    if progress:
+                        progress("model_ready", None, None)
                     return ModelArtifact(checkpoint, index, metadata["sha256"])
 
             staging = self.settings.root / f".staging-{reference_key}"
@@ -272,7 +288,9 @@ class ModelStore:
             staging.mkdir()
             package = staging / "download"
             try:
-                self._download(url, package)
+                if progress:
+                    progress("resolving_model", None, None)
+                self._download(url, package, progress)
                 package_hash = sha256_file(package)
                 if expected_hash and not hmac.compare_digest(package_hash, expected_hash.lower()):
                     raise ModelSecurityError("model package checksum did not match its signed token")
@@ -297,6 +315,8 @@ class ModelStore:
                 if not checkpoints:
                     raise ModelStoreError("model package contains no checkpoint")
                 checkpoint = checkpoints[0]
+                if progress:
+                    progress("validating_model", None, None)
                 self._validate_checkpoint(checkpoint)
                 object_root = self.settings.root / "objects" / package_hash
                 if not object_root.exists():
@@ -309,6 +329,8 @@ class ModelStore:
                     "index": str(selected_index.relative_to(object_root)) if selected_index else None,
                 }
                 reference.write_text(json.dumps(metadata, separators=(",", ":")), encoding="utf-8")
+                if progress:
+                    progress("model_ready", None, None)
                 return ModelArtifact(selected_checkpoint, selected_index, package_hash)
             finally:
                 shutil.rmtree(staging, ignore_errors=True)

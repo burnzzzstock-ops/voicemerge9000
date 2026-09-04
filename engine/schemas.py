@@ -80,6 +80,10 @@ class JobProgress(StrictModel):
     tracks: dict[str, str] = Field(default_factory=dict)
     speaker_errors: dict[str, str] = Field(default_factory=dict)
     error: str | None = None
+    stage: str | None = None
+    active_speaker: str | None = None
+    downloaded_bytes: int | None = Field(default=None, ge=0)
+    total_bytes: int | None = Field(default=None, ge=0)
 
 
 class HealthResponse(StrictModel):

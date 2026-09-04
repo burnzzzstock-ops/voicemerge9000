@@ -52,6 +52,48 @@ def test_zip_traversal_is_rejected_before_extraction(tmp_path: Path) -> None:
         store._extract_zip(package, tmp_path / "extract")
 
 
+def test_oversized_optional_index_is_skipped(tmp_path: Path) -> None:
+    package = tmp_path / "large-index.zip"
+    with zipfile.ZipFile(package, "w") as archive:
+        archive.writestr("voice.pth", b"checkpoint")
+        archive.writestr("voice.index", b"index-is-optional")
+    settings = ModelStoreSettings(
+        root=tmp_path / "cache",
+        allowed_hosts=("huggingface.co",),
+        token_secret=None,
+        max_download_bytes=1024,
+        max_extracted_bytes=1024,
+        max_checkpoint_bytes=1024,
+        max_index_bytes=4,
+    )
+    store = ModelStore(settings)
+    extracted = tmp_path / "extract"
+
+    store._extract_zip(package, extracted)
+
+    assert (extracted / "voice.pth").read_bytes() == b"checkpoint"
+    assert not (extracted / "voice.index").exists()
+
+
+def test_oversized_checkpoint_is_still_rejected(tmp_path: Path) -> None:
+    package = tmp_path / "large-checkpoint.zip"
+    with zipfile.ZipFile(package, "w") as archive:
+        archive.writestr("voice.pth", b"checkpoint")
+    settings = ModelStoreSettings(
+        root=tmp_path / "cache",
+        allowed_hosts=("huggingface.co",),
+        token_secret=None,
+        max_download_bytes=1024,
+        max_extracted_bytes=1024,
+        max_checkpoint_bytes=4,
+        max_index_bytes=1024,
+    )
+    store = ModelStore(settings)
+
+    with pytest.raises(ModelSecurityError):
+        store._extract_zip(package, tmp_path / "extract")
+
+
 def test_untrusted_or_insecure_model_hosts_are_rejected(tmp_path: Path) -> None:
     settings = ModelStoreSettings(
         root=tmp_path / "cache",

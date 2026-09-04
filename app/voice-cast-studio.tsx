@@ -67,6 +67,10 @@ type EngineJob = {
   tracks: Record<string, string>;
   speaker_errors: Record<string, string>;
   error?: string;
+  stage?: string;
+  active_speaker?: string;
+  downloaded_bytes?: number;
+  total_bytes?: number;
 };
 type ToolRegistration = {
   name: string;
@@ -131,6 +135,23 @@ function formatTime(value: number) {
 function formatBytes(bytes: number) {
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function jobProgressLabel(job: EngineJob, speakers: Speaker[]) {
+  const speaker = speakers.find((candidate) => candidate.id === job.active_speaker);
+  const voice = speaker?.label ?? 'the current voice';
+  if (job.stage === 'downloading_model') {
+    const received = job.downloaded_bytes === undefined ? '' : formatBytes(job.downloaded_bytes);
+    const total = job.total_bytes ? ` / ${formatBytes(job.total_bytes)}` : '';
+    return `Downloading ${voice} model${received ? ` · ${received}${total}` : ''}`;
+  }
+  if (job.stage === 'extracting_model') return `Unpacking ${voice} model`;
+  if (job.stage === 'validating_model') return `Safety-checking ${voice} model`;
+  if (job.stage === 'resolving_model') return `Connecting to ${voice} model`;
+  if (job.stage === 'converting_audio') return `Converting ${voice} on the GPU`;
+  if (job.stage === 'assembling_track') return `Restoring ${voice} to the scene timeline`;
+  if (job.stage === 'preparing_audio') return 'Reading and preparing the scene audio';
+  return `Converting the cast · ${Math.round(job.progress * 100)}%`;
 }
 
 function safeHttpUrl(value: string) {
@@ -878,12 +899,14 @@ export default function VoiceCastStudio() {
           <div className="job-list">
             {usedSpeakers.length ? usedSpeakers.map((speaker) => {
               const speakerError = engineJob?.speaker_errors?.[speaker.id];
+              const speakerReady = Boolean(speaker.converted || engineJob?.tracks?.[speaker.id]);
+              const speakerActive = engineJob?.active_speaker === speaker.id;
               return <article className="job-card" key={speaker.id} style={{ '--speaker': speaker.color } as CSSProperties}>
                 <div className="job-number">{String.fromCharCode(65 + speakers.indexOf(speaker))}</div>
                 <div className="job-title"><strong>{speaker.model?.name ?? `${speaker.label} needs a model`}</strong><span>{analysis?.segments.filter((segment) => segment.speakerId === speaker.id).length ?? 0} timed sections</span></div>
-                <div className={`job-status ${speakerError ? 'job-failed' : speaker.converted ? 'job-complete' : ''}`}>
-                  {speakerError ? <X /> : speaker.converted ? <Check /> : conversionState === 'working' ? <LoaderCircle className="spin" /> : <span />}
-                  {speakerError ? 'Needs attention' : speaker.converted ? 'Converted' : speaker.model ? 'Ready' : 'Pick model'}
+                <div className={`job-status ${speakerError ? 'job-failed' : speakerReady ? 'job-complete' : ''}`}>
+                  {speakerError ? <X /> : speakerReady ? <Check /> : speakerActive ? <LoaderCircle className="spin" /> : <span />}
+                  {speakerError ? 'Needs attention' : speakerReady ? 'Converted' : speakerActive ? 'Working' : speaker.model ? 'Ready' : 'Pick model'}
                 </div>
                 {speakerError ? <p className="speaker-error">{speakerError}</p> : null}
                 {speaker.converted ? <audio controls src={speaker.converted.url}><track kind="captions" /></audio> : null}
@@ -892,7 +915,7 @@ export default function VoiceCastStudio() {
           </div>
           {conversionState === 'working' ? <div className="conversion-progress" aria-live="polite">
             <div><span style={{ width: `${Math.max(2, (engineJob?.progress ?? 0.02) * 100)}%` }} /></div>
-            <p>{engineJob?.status === 'processing' ? `Converting the cast · ${Math.round(engineJob.progress * 100)}%` : 'Uploading the reviewed scene…'}</p>
+            <p>{engineJob?.status === 'processing' ? jobProgressLabel(engineJob, speakers) : 'Uploading the reviewed scene…'}</p>
           </div> : null}
           <div className="merge-strip">
             <div><p className="eyebrow">FINAL MASTER</p><strong>{!usedSpeakers.length
