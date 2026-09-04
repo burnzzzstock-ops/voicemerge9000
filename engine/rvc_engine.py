@@ -93,7 +93,6 @@ class RVCEngine:
             "--model", str(model.checkpoint),
             "--input", str(input_directory),
             "--output", str(output_directory),
-            "--speaker-id", "0",
             "--pitch", str(params.pitch),
             "--f0-method", params.f0_method,
             "--index-rate", str(params.index_rate if model.index else 0),

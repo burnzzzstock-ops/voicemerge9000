@@ -14,7 +14,7 @@ Use fictional, stylized, public-domain, or otherwise authorized voices. The proj
 - Official RVC CLI inference, CUDA detection with CPU fallback, and one model load per speaker batch
 - Sample-accurate cue extraction, duration-drift correction, 5 ms edge fades, silent full-length stems, and a browser-local 48 kHz / 24-bit master
 - Failure isolation: one failed speaker does not discard successful tracks
-- Model cache and trust boundary: HTTPS allowlist or HMAC-signed IDs, redirect/DNS checks, size ceilings, safe archive extraction, SHA-256 object storage, and PyTorch weights-only preflight
+- Model cache and trust boundary: HTTPS host allowlisting with optional HMAC-signed IDs/checksums, redirect/DNS checks, size ceilings, safe archive extraction, SHA-256 object storage, and PyTorch weights-only preflight
 - A development copy backend so the entire upload → poll → download → merge flow can be tested without a GPU or model
 
 The speaker draft is a guess, not full diarization. Music, effects, crosstalk, and similar voices can confuse it; human review is intentionally part of the workflow.
@@ -76,7 +76,7 @@ pnpm build
 - `GET /api/v1/jobs/{job_id}/tracks/{speaker_id}.wav`
 - `DELETE /api/v1/jobs/{job_id}` after the tracks are downloaded
 
-The browser calls `/api/engine/*`; the web app proxies that to `RVC_ENGINE_URL` and injects the private engine token. Set `VOICEMERGE_MODEL_HOSTS` to the smallest host allowlist you need. Production model registries can issue `v1.<payload>.<hmac>` model IDs containing an expiry, URL, and optional SHA-256.
+The browser calls `/api/engine/*`; the web app proxies that to `RVC_ENGINE_URL` and injects the private engine token. Set `VOICEMERGE_MODEL_HOSTS` to the smallest host allowlist you need. Production model registries can additionally issue `v1.<payload>.<hmac>` model IDs containing an expiry, allowlisted URL, and optional SHA-256.
 
 ## Deployment
 
