@@ -31,7 +31,7 @@ async function proxy(request: Request, context: { params: Promise<{ path: string
   }
 
   const { path } = await context.params;
-  const safePath = path.filter((part) => /^[A-Za-z0-9._-]+$/.test(part));
+  const safePath = path.filter((part) => part !== '.' && part !== '..' && /^[A-Za-z0-9._-]+$/.test(part));
   if (safePath.length !== path.length) return jsonError('Invalid engine path.', 400);
   const target = new URL(`/api/v1/${safePath.join('/')}${new URL(request.url).search}`, origin);
   const headers = new Headers();
@@ -47,6 +47,7 @@ async function proxy(request: Request, context: { params: Promise<{ path: string
       headers,
       body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
       redirect: 'manual',
+      signal: request.signal,
     });
     const responseHeaders = new Headers();
     for (const name of ['accept-ranges', 'content-disposition', 'content-length', 'content-range', 'content-type']) {
@@ -61,5 +62,6 @@ async function proxy(request: Request, context: { params: Promise<{ path: string
 }
 
 export const GET = proxy;
+export const HEAD = proxy;
 export const POST = proxy;
 export const DELETE = proxy;

@@ -2,6 +2,15 @@
 @import 'tw-animate-css';
 @import 'shadcn/tailwind.css';
 
+.stem-previews { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 1rem; }
+.stem-previews > div { display: grid; gap: .5rem; flex: 1; min-width: 240px; }
+.stem-previews audio { width: 100%; }
+.timing-editor { display: flex; flex-wrap: wrap; align-items: end; gap: .5rem; width: 100%; padding: .5rem 0; grid-column: 1 / -1; }
+.timing-editor label { display: grid; gap: .25rem; font-size: .875rem; }
+.timing-editor input { width: 8rem; background: #15151c; color: #fff; border: 1px solid #555; padding: .4rem; border-radius: .4rem; }
+.segment-row { flex-wrap: wrap; }
+button:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
+
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
@@ -197,7 +206,9 @@ audio { height: 34px; filter: grayscale(1) invert(0.88); opacity: 0.8; }
 .job-status.job-complete { border-color: color-mix(in oklab, var(--speaker) 22%, transparent); color: var(--speaker); background: color-mix(in oklab, var(--speaker) 5%, transparent); }
 .job-status.job-failed { border-color: color-mix(in oklab, var(--orange) 28%, transparent); color: var(--orange); }
 .speaker-error { grid-column: 2 / -1; margin: -3px 0 0; color: color-mix(in oklab, var(--orange) 72%, white); font-size: 8px; line-height: 1.5; }
-.job-card > audio { grid-column: 2 / -1; width: 100%; }
+.speaker-preview { grid-column: 2 / -1; min-width: 0; }
+.speaker-preview p { margin: 0 0 6px; font-size: 10px; color: oklch(1 0 0 / .6); }
+.speaker-preview audio { width: 100%; }
 .conversion-progress { margin-top: 13px; }
 .conversion-progress > div { overflow: hidden; height: 5px; border-radius: 99px; background: oklch(1 0 0 / .07); }
 .conversion-progress > div > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--violet), var(--cyan), var(--lime)); transition: width .3s ease; }

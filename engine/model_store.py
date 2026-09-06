@@ -278,6 +278,8 @@ class ModelStore:
                 checkpoint = object_root / metadata["checkpoint"]
                 index = object_root / metadata["index"] if metadata.get("index") else None
                 if checkpoint.is_file() and (index is None or index.is_file()):
+                    if expected_hash and not hmac.compare_digest(metadata["sha256"], expected_hash.lower()):
+                        raise ModelSecurityError("cached model package checksum did not match its signed token")
                     if progress:
                         progress("model_ready", None, None)
                     return ModelArtifact(checkpoint, index, metadata["sha256"])

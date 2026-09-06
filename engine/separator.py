@@ -5,8 +5,10 @@ import gc
 import os
 import subprocess
 import sys
+import time
 from contextlib import nullcontext
 from pathlib import Path
+from .gpu_budget import configure_budget, save_metrics
 
 
 class SeparationError(RuntimeError):
@@ -34,6 +36,7 @@ def _worker_environment() -> dict[str, str]:
     }
     environment = {key: value for key, value in os.environ.items() if key in allowed}
     environment["PYTHONUNBUFFERED"] = "1"
+    environment["PYTORCH_CUDA_ALLOC_CONF"] = "backend:native"
     return environment
 
 
@@ -88,9 +91,10 @@ def _separate_worker(source: Path, output_dir: Path) -> None:
     overlap = float(os.getenv("VOICEMERGE_DEMUCS_OVERLAP", "0.1"))
     precision = os.getenv("VOICEMERGE_DEMUCS_PRECISION", "fp16").lower()
     model = None
+    started = time.monotonic()
+    metrics = configure_budget(torch)
+    metrics.update(stage="demucs", status="failed")
     try:
-        if device == "cuda":
-            torch.cuda.reset_peak_memory_stats()
         model = pretrained.get_model(model_name)
         model.eval()
         mix = AudioFile(source).read(
@@ -130,12 +134,15 @@ def _separate_worker(source: Path, output_dir: Path) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         sf.write(output_dir / "vocals.wav", vocals.transpose(0, 1).numpy(), model.samplerate, subtype="FLOAT")
         sf.write(output_dir / "background.wav", background.transpose(0, 1).numpy(), model.samplerate, subtype="FLOAT")
+        metrics["status"] = "completed"
         if device == "cuda":
             peak = max(torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()) / 1024**3
             print(f"demucs_peak_vram_gb={peak:.3f}", flush=True)
             if peak > float(os.getenv("VOICEMERGE_MAX_GPU_GB", "6.5")):
                 raise SeparationError(f"Demucs exceeded the configured GPU budget ({peak:.2f} GB)")
     finally:
+        metrics["duration_seconds"] = time.monotonic() - started
+        save_metrics(torch, output_dir / "gpu-separation.json", metrics)
         del model
         gc.collect()
         if "torch" in locals() and torch.cuda.is_available():

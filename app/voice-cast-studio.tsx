@@ -32,6 +32,8 @@ import {
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { OperationGate } from '@/lib/operation';
+import { isValidTimingEdit, type SpeechWindow } from '@/lib/timing';
 
 type LocalAudio = { file: File; url: string };
 type ModelResult = {
@@ -52,7 +54,7 @@ type Speaker = {
   converted?: LocalAudio;
   gain: number;
 };
-type Segment = { id: string; start: number; end: number; speakerId: string; confidence: number };
+type Segment = SpeechWindow & { id: string; speakerId: string; confidence: number };
 type AnalysisResult = {
   jobId: string;
   buffer: AudioBuffer;
@@ -61,7 +63,9 @@ type AnalysisResult = {
   speechCoverage: number;
   peaks: number[];
   segments: Segment[];
+  tracks: Record<string, string>;
 };
+type AnalysisPayload = { job_id: string; duration_ms: number; sample_rate: number; speech_coverage: number; cues: Array<{ cue_id: string; start_ms: number; end_ms: number }>; tracks: Record<string, string>; boundary_tolerance_ms: number };
 type EngineHealth = {
   state: 'checking' | 'ready' | 'offline';
   backend?: string;
@@ -79,6 +83,8 @@ type EngineJob = {
   active_speaker?: string;
   downloaded_bytes?: number;
   total_bytes?: number;
+  attempt_id?: string;
+  analysis?: AnalysisPayload;
 };
 type ToolRegistration = {
   name: string;
@@ -156,11 +162,15 @@ function jobProgressLabel(job: EngineJob, speakers: Speaker[]) {
   if (job.stage === 'extracting_model') return `Unpacking ${voice} model`;
   if (job.stage === 'validating_model') return `Safety-checking ${voice} model`;
   if (job.stage === 'resolving_model') return `Connecting to ${voice} model`;
-  if (job.stage === 'converting_speech') return `Converting ${voice} on the GPU`;
+  if (job.stage === 'converting_speech') return `Converting ${voice}'s isolated speech`;
   if (job.stage === 'assembling_speaker_stem') return `Restoring ${voice} to the scene timeline`;
   if (job.stage === 'preparing_vocals') return 'Reading the isolated speech track';
   if (job.stage === 'mixing_master') return 'Combining voices with the stereo background';
-  return `Converting the cast · ${Math.round(job.progress * 100)}%`;
+  if (job.stage === 'queued_separation') return 'Waiting for the audio engine to separate the scene';
+  if (job.stage === 'separating_vocals') return 'Separating dialogue from the background';
+  if (job.stage === 'detecting_speech') return 'Finding speech sections in the isolated vocals';
+  if (job.stage === 'completed') return 'Finished';
+  return 'Waiting for the local engine';
 }
 
 function safeHttpUrl(value: string) {
@@ -247,42 +257,48 @@ function monoSamples(buffer: AudioBuffer) {
   return mono;
 }
 
-function assignSegments(buffer: AudioBuffer, regions: Array<{ id: string; start: number; end: number }>, speakers: Speaker[]) {
+function assignSegments(buffer: AudioBuffer, regions: Array<SpeechWindow & { id: string }>, speakers: Speaker[]) {
   const mono = monoSamples(buffer);
   const features = regions.map((region) => segmentFeatures(mono, buffer.sampleRate, region.start, region.end));
   const assignments = clusterSegments(features, speakers.length);
   return regions.map((region, index) => ({
     ...region,
     speakerId: speakers[assignments[index] ?? 0].id,
-    confidence: Math.max(0.46, Math.min(0.89, 0.62 + features[index][0] * 1.8)),
+    confidence: 0,
   }));
 }
 
-async function analyzeScene(file: File, speakers: Speaker[]): Promise<AnalysisResult> {
-  const decoder = new AudioContext();
+async function analyzeScene(file: File, speakers: Speaker[], signal: AbortSignal, onProgress: (job: EngineJob) => void): Promise<AnalysisResult> {
+  const decoder = new AudioContext({ sampleRate: 48_000 });
   try {
     const form = new FormData();
     form.append('audio_file', file, file.name);
-    const [buffer, response] = await Promise.all([
-      decoder.decodeAudioData(await file.arrayBuffer()),
-      fetch('/api/engine/analyze', { method: 'POST', body: form }),
-    ]);
-    const payload = await response.json() as {
-      job_id?: string;
-      duration_ms?: number;
-      sample_rate?: number;
-      speech_coverage?: number;
-      cues?: Array<{ cue_id: string; start_ms: number; end_ms: number }>;
-      error?: string;
-      detail?: string;
-    };
-    if (!response.ok || !payload.job_id || !payload.cues) {
-      throw new Error(payload.error || payload.detail || 'The local engine could not analyze this scene.');
+    const response = await fetch('/api/engine/analyze?background=true', { method: 'POST', body: form, signal });
+    const created = await response.json() as { job_id?: string; error?: string; detail?: string };
+    if (!response.ok || !created.job_id) throw new Error(created.error || created.detail || 'Analysis could not start.');
+    let payload: AnalysisPayload | undefined;
+    for (let attempt = 0; attempt < 3600; attempt += 1) {
+      signal.throwIfAborted();
+      const status = await fetch(`/api/engine/jobs/${created.job_id}`, { cache: 'no-store', signal });
+      const job = await status.json() as EngineJob;
+      if (!status.ok) throw new Error('Analysis expired or the engine restarted. Please upload again.');
+      onProgress(job);
+      if (job.status === 'failed') throw new Error(job.error || 'Scene analysis failed. Please retry.');
+      if (job.status === 'analyzed' && job.analysis) { payload = job.analysis; break; }
+      await wait(1000);
     }
+    if (!payload) throw new Error('Analysis timed out. Please check the engine and retry.');
+    const vocalResponse = await fetch(engineTrackUrl(payload.tracks.vocals), { signal });
+    if (!vocalResponse.ok) throw new Error('The isolated vocals could not be loaded. Please analyze again.');
+    const buffer = await decoder.decodeAudioData(await vocalResponse.arrayBuffer());
     const regions = payload.cues.map((cue) => ({
       id: cue.cue_id,
       start: cue.start_ms / 1000,
       end: cue.end_ms / 1000,
+      detectedStart: cue.start_ms / 1000,
+      detectedEnd: cue.end_ms / 1000,
+      minStart: Math.max(0, (cue.start_ms - payload!.boundary_tolerance_ms) / 1000),
+      maxEnd: Math.min(buffer.duration, (cue.end_ms + payload!.boundary_tolerance_ms) / 1000),
     }));
     const segments = assignSegments(buffer, regions, speakers);
     const mono = monoSamples(buffer);
@@ -307,6 +323,7 @@ async function analyzeScene(file: File, speakers: Speaker[]): Promise<AnalysisRe
       speechCoverage: payload.speech_coverage ?? 0,
       peaks,
       segments,
+      tracks: payload.tracks,
     };
   } finally {
     await decoder.close();
@@ -321,7 +338,7 @@ function UploadScene({ value, busy, onFile }: { value?: LocalAudio; busy: boolea
         id={inputId}
         className="sr-only"
         type="file"
-        accept="audio/mpeg,audio/wav,audio/x-wav,audio/mp4,audio/aac,.mp3,.wav,.m4a"
+        accept="audio/*,video/mp4,video/webm,.mp3,.wav,.m4a,.mp4,.webm,.mov"
         onChange={(event) => {
           const file = event.target.files?.[0];
           if (file) onFile(file);
@@ -360,7 +377,27 @@ export default function VoiceCastStudio() {
   const [playingSegment, setPlayingSegment] = useState('');
   const [playhead, setPlayhead] = useState(0);
   const audioRef = useRef<HTMLAudioElement>(null);
+  const vocalRef = useRef<HTMLAudioElement>(null);
   const stopTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const operations = useRef(new OperationGate());
+  const searchOperation = useRef(new OperationGate());
+  const busy = analyzing || conversionState === 'working';
+
+  function invalidateResult() {
+    setMix(undefined);
+    setEngineJob(undefined);
+    setConversionError('');
+    setMixError('');
+    setConversionState('idle');
+    setMixState('idle');
+    setSpeakers((current) => current.map((speaker) => ({ ...speaker, converted: undefined })));
+  }
+
+  useEffect(() => () => {
+    operations.current.cancel();
+    searchOperation.current.cancel();
+    if (stopTimer.current) clearTimeout(stopTimer.current);
+  }, []);
 
   const usedSpeakerIds = useMemo(
     () => new Set((analysis?.segments ?? []).map((segment) => segment.speakerId)),
@@ -402,6 +439,7 @@ export default function VoiceCastStudio() {
         },
         annotations: { readOnlyHint: false, untrustedContentHint: false },
         execute(input) {
+          if (operations.current.busy) throw new Error('Wait for processing to finish before changing the cast.');
           const values = (input as { speakers?: unknown })?.speakers;
           if (!Array.isArray(values) || values.length < 1 || values.length > MAX_SPEAKERS) {
             throw new Error(`Provide between 1 and ${MAX_SPEAKERS} speakers.`);
@@ -422,7 +460,9 @@ export default function VoiceCastStudio() {
               },
             };
           });
+          invalidateResult();
           setSpeakers(next);
+          setAnalysis((current) => current && { ...current, segments: current.segments.map((segment) => next.some((speaker) => speaker.id === segment.speakerId) ? segment : { ...segment, speakerId: next[0].id, confidence: 0 }) });
           setActiveSpeakerId(next[0].id);
           return { assigned: true, speakerCount: next.length };
         },
@@ -434,18 +474,23 @@ export default function VoiceCastStudio() {
   }, []);
 
   async function runAnalysis(file: File, nextSpeakers = speakers) {
+    const operation = operations.current.start();
     setAnalyzing(true);
     setAnalysisError('');
     try {
-      setAnalysis(await analyzeScene(file, nextSpeakers));
+      const result = await analyzeScene(file, nextSpeakers, operation.signal, (job) => { if (operation.current()) setEngineJob(job); });
+      if (operation.current()) setAnalysis(result);
     } catch (error) {
+      if (!operation.current()) return;
       setAnalysisError(error instanceof Error ? error.message : 'The local engine could not analyze that audio file.');
     } finally {
-      setAnalyzing(false);
+      if (operation.current()) { setAnalyzing(false); operations.current.finish(operation); }
     }
   }
 
   function chooseScene(file: File) {
+    operations.current.cancel();
+    invalidateResult();
     const next = replaceAudio(file, scene);
     if (mix) URL.revokeObjectURL(mix.url);
     setScene(next);
@@ -459,6 +504,8 @@ export default function VoiceCastStudio() {
   }
 
   function changeSpeakerCount(count: number) {
+    if (operations.current.busy) return;
+    invalidateResult();
     const next = makeSpeakers(count, speakers).map((speaker) => ({ ...speaker, converted: undefined }));
     setSpeakers(next);
     setConversionState('idle');
@@ -466,33 +513,33 @@ export default function VoiceCastStudio() {
     if (!next.some((speaker) => speaker.id === activeSpeakerId)) setActiveSpeakerId(next[0].id);
     setAnalysis((current) => current && {
       ...current,
-      segments: assignSegments(
-        current.buffer,
-        current.segments.map(({ id, start, end }) => ({ id, start, end })),
-        next,
-      ),
+      segments: current.segments.map((segment) => next.some((speaker) => speaker.id === segment.speakerId) ? segment : { ...segment, speakerId: next[0].id, confidence: 0 }),
     });
   }
 
   async function searchModels(event?: SyntheticEvent<HTMLFormElement>) {
     event?.preventDefault();
     if (!query.trim()) return;
+    const operation = searchOperation.current.start();
     setSearching(true);
     setSearchError('');
     try {
-      const response = await fetch(`/api/models/search?q=${encodeURIComponent(query.trim())}`);
+      const response = await fetch(`/api/models/search?q=${encodeURIComponent(query.trim())}`, { signal: operation.signal });
       const payload = (await response.json()) as { results?: ModelResult[]; error?: string };
       if (!response.ok) throw new Error(payload.error || 'Model search failed.');
-      setResults(payload.results ?? []);
+      if (operation.current()) setResults(payload.results ?? []);
     } catch (error) {
+      if (!operation.current()) return;
       setSearchError(error instanceof Error ? error.message : 'Model search failed.');
       setResults([]);
     } finally {
-      setSearching(false);
+      if (operation.current()) { setSearching(false); searchOperation.current.finish(operation); }
     }
   }
 
   function assignModel(model: ModelResult) {
+    if (operations.current.busy) return;
+    invalidateResult();
     setSpeakers((current) => current.map((speaker) =>
       speaker.id === activeSpeakerId ? { ...speaker, model, converted: undefined } : speaker,
     ));
@@ -500,12 +547,16 @@ export default function VoiceCastStudio() {
     setMixState('idle');
   }
 
-  function playSegment(segment: Segment) {
-    const player = audioRef.current;
+  function playSegment(segment: Segment, isolated = false) {
+    const player = isolated ? vocalRef.current : audioRef.current;
     if (!player) return;
     if (stopTimer.current) clearTimeout(stopTimer.current);
+    const wasPlaying = !player.paused && playingSegment === segment.id;
+    audioRef.current?.pause();
+    vocalRef.current?.pause();
+    if (wasPlaying) { setPlayingSegment(''); return; }
     player.currentTime = segment.start;
-    void player.play();
+    void player.play().catch(() => { setPlayingSegment(''); setPromptReply('Playback could not start. Try the audio player controls.'); });
     setPlayingSegment(segment.id);
     stopTimer.current = setTimeout(() => {
       player.pause();
@@ -513,7 +564,24 @@ export default function VoiceCastStudio() {
     }, Math.max(100, (segment.end - segment.start) * 1000));
   }
 
+  function editBoundary(event: SyntheticEvent<HTMLFormElement>, segment: Segment) {
+    event.preventDefault();
+    if (operations.current.busy || !analysis) return;
+    const data = new FormData(event.currentTarget);
+    const start = Number(data.get('start'));
+    const end = Number(data.get('end'));
+    if (!isValidTimingEdit(segment, start, end, analysis.segments.filter((other) => other.id !== segment.id))) {
+      setPromptReply('Timing must overlap the originally detected speech, stay within the displayed limits, last at least 40 ms, and not overlap another section.');
+      return;
+    }
+    invalidateResult();
+    setAnalysis({ ...analysis, segments: analysis.segments.map((item) => item.id === segment.id ? { ...item, start, end } : item) });
+    setPromptReply('Timing updated. Preview the word edges before merging.');
+  }
+
   function updateSegmentSpeaker(id: string, speakerId: string) {
+    if (operations.current.busy) return;
+    invalidateResult();
     setAnalysis((current) => current && {
       ...current,
       segments: current.segments.map((segment) => segment.id === id ? { ...segment, speakerId, confidence: 1 } : segment),
@@ -524,12 +592,18 @@ export default function VoiceCastStudio() {
   }
 
   function splitAtPlayhead() {
+    if (operations.current.busy) return;
     if (!analysis || playhead <= 0 || playhead >= analysis.duration) return;
     const target = analysis.segments.find((segment) => playhead > segment.start + 0.08 && playhead < segment.end - 0.08);
     if (!target) {
       setPromptReply('Move the player into a colored section first, then split.');
       return;
     }
+    if (!isValidTimingEdit(target, target.start, playhead, []) || !isValidTimingEdit(target, playhead, target.end, [])) {
+      setPromptReply('Split inside detected speech so both new sections contain speech.');
+      return;
+    }
+    invalidateResult();
     setAnalysis({
       ...analysis,
       segments: analysis.segments.flatMap((segment) => segment.id === target.id ? [
@@ -544,7 +618,9 @@ export default function VoiceCastStudio() {
   }
 
   async function convertAndMerge() {
-    if (!analysis || !scene || !modelsReady || engineHealth.state !== 'ready') return;
+    if (operations.current.busy || !analysis || !scene || !modelsReady || engineHealth.state !== 'ready') return;
+    const operation = operations.current.start();
+    setMix(undefined);
     setConversionState('working');
     setConversionError('');
     setMixError('');
@@ -560,12 +636,13 @@ export default function VoiceCastStudio() {
           .sort((a, b) => a.start - b.start)
           .map((segment) => ({
             cue_id: segment.id.replace(/[^A-Za-z0-9._-]/g, '-').slice(0, 64),
-            start_ms: Math.max(0, Math.round(segment.start * 1000)),
-            end_ms: Math.min(Math.round(analysis.duration * 1000), Math.round(segment.end * 1000)),
+            start_ms: Math.max(0, segment.start * 1000),
+            end_ms: segment.end * 1000,
           })),
       }));
       const response = await fetch('/api/engine/convert', {
         method: 'POST',
+        signal: operation.signal,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           job_id: analysis.jobId,
@@ -573,40 +650,30 @@ export default function VoiceCastStudio() {
           params: { pitch: 0, f0_method: 'rmvpe', index_rate: 0.75 },
         }),
       });
-      const created = await response.json() as { job_id?: string; error?: string; detail?: string };
+      const created = await response.json() as { job_id?: string; attempt_id?: string; error?: string; detail?: string };
       if (!response.ok || !created.job_id) throw new Error(created.error || created.detail || 'The conversion job could not start.');
 
       let job: EngineJob | undefined;
       for (let attempt = 0; attempt < 3600; attempt += 1) {
-        const statusResponse = await fetch(`/api/engine/jobs/${created.job_id}`, { cache: 'no-store' });
+        operation.signal.throwIfAborted();
+        const statusResponse = await fetch(`/api/engine/jobs/${created.job_id}`, { cache: 'no-store', signal: operation.signal });
         const payload = await statusResponse.json() as EngineJob & { detail?: string };
         if (!statusResponse.ok) throw new Error(payload.detail || 'The conversion job disappeared.');
         job = payload;
+        if (!operation.current()) return;
+        if (created.attempt_id && job.attempt_id !== created.attempt_id) throw new Error('This job was replaced by another conversion. Please retry.');
         setEngineJob(job);
         if (job.status === 'completed' || job.status === 'failed') break;
         await wait(1000);
       }
       if (!job || !['completed', 'failed'].includes(job.status)) throw new Error('The conversion job timed out.');
 
-      const returned = await Promise.all(usedSpeakers.map(async (speaker) => {
-        const track = job!.tracks[speaker.id];
-        if (!track) return speaker;
-        const trackResponse = await fetch(engineTrackUrl(track));
-        if (!trackResponse.ok) throw new Error(`The ${speaker.label} track could not be downloaded.`);
-        const blob = await trackResponse.blob();
-        const file = new File([blob], `${speaker.id}.wav`, { type: 'audio/wav' });
-        return { ...speaker, converted: replaceAudio(file, speaker.converted) };
-      }));
-      const returnedById = new Map(returned.map((speaker) => [speaker.id, speaker]));
-      const nextSpeakers = speakers.map((speaker) => returnedById.get(speaker.id) ?? speaker);
-      setSpeakers(nextSpeakers);
+      if (!operation.current()) return;
       const failures = Object.entries(job.speaker_errors ?? {});
+      if (job.status !== 'completed' || failures.length) throw new Error(job.error || 'Some voices failed. Preview successful voices below, then retry.');
       const masterTrack = job.tracks.master;
       if (!masterTrack) throw new Error(job.error || 'The engine did not produce a final master.');
-      const masterResponse = await fetch(engineTrackUrl(masterTrack));
-      if (!masterResponse.ok) throw new Error('The final master could not be downloaded.');
-      const masterBlob = await masterResponse.blob();
-      const nextMix = { url: URL.createObjectURL(masterBlob), duration: analysis.duration };
+      const nextMix = { url: engineTrackUrl(masterTrack), duration: analysis.duration };
       if (mix) URL.revokeObjectURL(mix.url);
       setMix(nextMix);
       setMixState('done');
@@ -615,15 +682,20 @@ export default function VoiceCastStudio() {
         setConversionError(failures.map(([speakerId, message]) => `${speakerId}: ${message}`).join(' · '));
       }
     } catch (error) {
+      if (!operation.current()) return;
       setConversionError(error instanceof Error ? error.message : 'The integrated voice conversion failed.');
       setConversionState('error');
       setMixState('error');
+    } finally {
+      operations.current.finish(operation);
     }
   }
 
   function applyPrompt(value = prompt) {
+    if (operations.current.busy) return;
     const text = value.trim().toLowerCase();
     if (!text) return;
+    invalidateResult();
     const swap = text.match(/swap\s+(?:voice\s+)?([a-f])\s+(?:and|with)\s+(?:voice\s+)?([a-f])/);
     const level = text.match(/(?:make|turn)\s+(?:voice\s+)?([a-f])\s+(louder|quieter|softer)/);
     const count = text.match(/(?:use|set|make)\s+([1-6])\s+(?:voices|speakers|characters)/);
@@ -698,6 +770,12 @@ export default function VoiceCastStudio() {
           <UploadScene value={scene} busy={analyzing} onFile={chooseScene} />
           {scene ? <audio ref={audioRef} className="scene-player" controls src={scene.url} onTimeUpdate={(event) => setPlayhead(event.currentTarget.currentTime)}><track kind="captions" /></audio> : null}
           {analysisError ? <p className="error-box">{analysisError}</p> : null}
+          {analyzing ? <output>{engineJob ? jobProgressLabel(engineJob, speakers) : 'Uploading to the local engine…'}</output> : null}
+          {analysisError && scene ? <Button variant="outline" onClick={() => void runAnalysis(scene.file)}>Retry analysis</Button> : null}
+          {analysis ? <div className="stem-previews">
+            <div>Isolated vocals<audio aria-label="Isolated vocals" ref={vocalRef} controls preload="none" src={engineTrackUrl(analysis.tracks.vocals)}><track kind="captions" /></audio></div>
+            <div>Stereo background<audio aria-label="Stereo background" controls preload="none" src={engineTrackUrl(analysis.tracks.background)}><track kind="captions" /></audio></div>
+          </div> : null}
         </section>
 
         <section id="step-2" className="work-card">
@@ -707,7 +785,7 @@ export default function VoiceCastStudio() {
             <div><p className="eyebrow">ISOLATED SPEECH DRAFT</p><h2>Check who talks where</h2></div>
             </div>
             <label className="speaker-count">Expected voices
-              <select value={speakers.length} onChange={(event) => changeSpeakerCount(Number(event.target.value))}>
+              <select disabled={busy} value={speakers.length} onChange={(event) => changeSpeakerCount(Number(event.target.value))}>
                 {[1, 2, 3, 4, 5, 6].map((value) => <option value={value} key={value}>{value}</option>)}
               </select><ChevronDown />
             </label>
@@ -717,7 +795,8 @@ export default function VoiceCastStudio() {
             <div className="empty-stage"><WandSparkles /><strong>Your speaker map appears here</strong><span>Upload an MP3 above to start.</span></div>
           ) : (
             <>
-              <div className="review-note"><Sparkles /> Demucs removed the background and Silero found the speech. Speaker labels are still an acoustic guess—click any wrong one before converting.</div>
+              <div className="review-note"><Sparkles /> Speech detection is not speaker identification. Listen and confirm the speaker guesses. Music vocals and overlapping voices can still need correction.</div>
+              {!analysis.segments.length ? <p className="error-box">No speech was detected. Listen to the isolated vocals and try a clearer source.</p> : null}
               <div className="timeline">
                 <button className="timeline-seek" aria-label="Audio timeline. Click to move the playhead." onKeyDown={(event) => {
                   if (event.key === 'ArrowLeft' && audioRef.current) audioRef.current.currentTime = Math.max(0, audioRef.current.currentTime - 1);
@@ -747,13 +826,20 @@ export default function VoiceCastStudio() {
                 {analysis.segments.map((segment, index) => {
                   const speaker = speakers.find((item) => item.id === segment.speakerId) ?? speakers[0];
                   return <div className="segment-row" key={segment.id}>
-                    <button className="mini-play" onClick={() => playSegment(segment)}>{playingSegment === segment.id ? <Pause /> : <Play />}</button>
+                    <button className="mini-play" aria-label={`Preview original section ${index + 1}`} onClick={() => playSegment(segment)}>{playingSegment === segment.id ? <Pause /> : <Play />}</button>
                     <span className="segment-index">{String(index + 1).padStart(2, '0')}</span>
                     <span className="segment-time">{formatTime(segment.start)} → {formatTime(segment.end)}</span>
-                    <span className="confidence">{segment.confidence === 1 ? 'human checked' : `${Math.round(segment.confidence * 100)}% guess`}</span>
-                    <select value={segment.speakerId} onChange={(event) => updateSegmentSpeaker(segment.id, event.target.value)} style={{ borderColor: speaker.color }}>
+                    <span className="confidence">{segment.confidence === 1 ? 'human checked' : 'unreviewed guess'}</span>
+                    <select aria-label={`Speaker for section ${index + 1}`} disabled={busy} value={segment.speakerId} onChange={(event) => updateSegmentSpeaker(segment.id, event.target.value)} style={{ borderColor: speaker.color }}>
                       {speakers.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
                     </select>
+                    <Button disabled={busy} variant="outline" size="sm" onClick={() => updateSegmentSpeaker(segment.id, segment.speakerId)}>Confirm</Button>
+                    <Button variant="outline" size="sm" onClick={() => playSegment(segment, true)}>Hear vocals</Button>
+                    <form className="timing-editor" key={`${segment.start}-${segment.end}`} onSubmit={(event) => editBoundary(event, segment)}>
+                      <label>Start (s)<input aria-label={`Start section ${index + 1}`} name="start" type="number" step="any" min={segment.minStart ?? segment.start} max={segment.end - 0.04} defaultValue={segment.start} disabled={busy} required /></label>
+                      <label>End (s)<input aria-label={`End section ${index + 1}`} name="end" type="number" step="any" min={segment.start + 0.04} max={segment.maxEnd ?? segment.end} defaultValue={segment.end} disabled={busy} required /></label>
+                      <Button disabled={busy} type="submit" variant="outline" size="sm">Apply timing</Button>
+                    </form>
                   </div>;
                 })}
               </div>
@@ -782,7 +868,9 @@ export default function VoiceCastStudio() {
             <div className="model-browser">
               <div className="model-browser-top">
                 <div><p>Picking for</p><strong style={{ color: activeSpeaker.color }}>{activeSpeaker.label}</strong></div>
-                {activeSpeaker.model ? <button className="clear-model" onClick={() => {
+                {activeSpeaker.model ? <button disabled={busy} className="clear-model" onClick={() => {
+                  if (operations.current.busy) return;
+                  invalidateResult();
                   setSpeakers((current) => current.map((speaker) => speaker.id === activeSpeaker.id ? { ...speaker, model: undefined, converted: undefined } : speaker));
                   setConversionState('idle');
                   setMixState('idle');
@@ -801,7 +889,7 @@ export default function VoiceCastStudio() {
                     <div className="model-copy"><strong>{model.name}</strong><small>{[model.creator, model.size].filter(Boolean).join(' · ') || 'Community model'}</small></div>
                     {model.sampleUrl ? <audio controls preload="none" src={model.sampleUrl}><track kind="captions" /></audio> : null}
                     <a href={model.pageUrl} target="_blank" rel="noreferrer" title="Open model page"><ExternalLink /></a>
-                    <Button size="sm" disabled={model.engineReady === false} onClick={() => assignModel(model)}>{model.engineReady === false ? 'Source not automatic' : activeSpeaker.model?.id === model.id ? <><Check /> Assigned</> : `Use for ${activeSpeaker.label}`}</Button>
+                    <Button size="sm" disabled={busy || model.engineReady === false} onClick={() => assignModel(model)}>{model.engineReady === false ? 'Source not automatic' : activeSpeaker.model?.id === model.id ? <><Check /> Assigned</> : `Use for ${activeSpeaker.label}`}</Button>
                   </article>)}
                 </div>
               )}
@@ -836,18 +924,18 @@ export default function VoiceCastStudio() {
               const speakerActive = engineJob?.active_speaker === speaker.id;
               return <article className="job-card" key={speaker.id} style={{ '--speaker': speaker.color } as CSSProperties}>
                 <div className="job-number">{String.fromCharCode(65 + speakers.indexOf(speaker))}</div>
-                <div className="job-title"><strong>{speaker.model?.name ?? `${speaker.label} needs a model`}</strong><span>{analysis?.segments.filter((segment) => segment.speakerId === speaker.id).length ?? 0} timed sections</span></div>
+                <div className="job-title"><strong>{speaker.model?.name ?? `${speaker.label} needs a model`}</strong><span>{analysis?.segments.filter((segment) => segment.speakerId === speaker.id).length ?? 0} timed sections · Mix gain {speaker.gain >= 1 ? '+' : ''}{(20 * Math.log10(speaker.gain)).toFixed(1)} dB</span></div>
                 <div className={`job-status ${speakerError ? 'job-failed' : speakerReady ? 'job-complete' : ''}`}>
                   {speakerError ? <X /> : speakerReady ? <Check /> : speakerActive ? <LoaderCircle className="spin" /> : <span />}
                   {speakerError ? 'Needs attention' : speakerReady ? 'Converted' : speakerActive ? 'Working' : speaker.model ? 'Ready' : 'Pick model'}
                 </div>
                 {speakerError ? <p className="speaker-error">{speakerError}</p> : null}
-                {speaker.converted ? <audio controls src={speaker.converted.url}><track kind="captions" /></audio> : null}
+                {engineJob?.tracks[speaker.id] ? <div className="speaker-preview"><p>Voice preview before mix gain. Hear volume adjustments in the final master.</p><audio aria-label={`${speaker.label} converted preview before mix gain`} controls preload="none" src={engineTrackUrl(engineJob.tracks[speaker.id])}><track kind="captions" /></audio></div> : null}
               </article>;
             }) : <div className="empty-stage compact"><FileAudio /><strong>No dialogue jobs yet</strong><span>Upload and review a scene first.</span></div>}
           </div>
           {conversionState === 'working' ? <div className="conversion-progress" aria-live="polite">
-            <div><span style={{ width: `${Math.max(2, (engineJob?.progress ?? 0.02) * 100)}%` }} /></div>
+            <LoaderCircle className="spin" />
             <p>{engineJob?.status === 'processing' ? jobProgressLabel(engineJob, speakers) : 'Starting the reviewed conversion…'}</p>
           </div> : null}
           <div className="merge-strip">
@@ -858,7 +946,7 @@ export default function VoiceCastStudio() {
                 : engineHealth.state !== 'ready'
                   ? 'Connect the included RVC engine to enable one-click conversion.'
                   : 'One click converts every cue, restores the timing, and builds the master.'}</strong></div>
-            <Button className="merge-button" disabled={!modelsReady || engineHealth.state !== 'ready' || conversionState === 'working' || mixState === 'working'} onClick={() => void convertAndMerge()}>{conversionState === 'working' || mixState === 'working' ? <LoaderCircle className="spin" /> : <WandSparkles />} {mix ? 'Rebuild voices + mix' : 'Convert all + merge'}</Button>
+            <Button className="merge-button" disabled={busy || !modelsReady || engineHealth.state !== 'ready'} onClick={() => void convertAndMerge()}>{busy ? <LoaderCircle className="spin" /> : <WandSparkles />} {conversionState === 'error' ? 'Retry failed voices + merge' : mix ? 'Rebuild voices + mix' : 'Convert all + merge'}</Button>
           </div>
           {conversionError ? <p className="error-box">{conversionError}</p> : null}
           {mixError ? <p className="error-box">{mixError}</p> : null}
@@ -871,7 +959,7 @@ export default function VoiceCastStudio() {
             <p className="eyebrow">PROMPT THE EDIT</p>
             <form onSubmit={(event) => { event.preventDefault(); applyPrompt(); }}>
               <Input value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Try: swap A and B, make B louder, use 4 speakers…" />
-              <Button type="submit"><Sparkles /> Apply</Button>
+              <Button disabled={busy} type="submit"><Sparkles /> Apply</Button>
             </form>
             <div className="suggestion-chips">{['Swap A and B', 'Make B louder', 'Use 4 speakers', 'Split at playhead'].map((suggestion) => <button key={suggestion} onClick={() => applyPrompt(suggestion)}>{suggestion}</button>)}</div>
             {promptReply ? <p className="prompt-reply">{promptReply}</p> : null}

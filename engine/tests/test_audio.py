@@ -14,11 +14,12 @@ def test_extract_cue_uses_sample_accurate_bounds() -> None:
 
 
 def test_pad_or_trim_does_not_resample_audio() -> None:
-    source = np.linspace(-0.5, 0.5, 93, dtype=np.float32)
-    fitted = pad_or_trim_clip(source, 100)
-    assert len(fitted) == 100
-    np.testing.assert_array_equal(fitted[:93], source)
-    np.testing.assert_array_equal(fitted[93:], np.zeros(7, dtype=np.float32))
+    source = np.linspace(-0.5, 0.5, 9300, dtype=np.float32)
+    fitted = pad_or_trim_clip(source, 10000)
+    assert len(fitted) == 10000
+    np.testing.assert_array_equal(fitted[:9060], source[:9060])
+    assert fitted[9299] == 0  # fade at the actual source end, before padding
+    np.testing.assert_array_equal(fitted[9300:], np.zeros(700, dtype=np.float32))
 
 
 def test_edge_fades_remove_boundary_clicks() -> None:

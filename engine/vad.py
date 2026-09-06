@@ -96,12 +96,12 @@ def _detect_worker(
         min_silence_duration_ms=min_silence_duration_ms,
         speech_pad_ms=int(os.getenv("VOICEMERGE_VAD_PAD_MS", "40")),
         max_speech_duration_s=float(os.getenv("VOICEMERGE_VAD_MAX_SPEECH_SECONDS", "15")),
-        return_seconds=True,
+        return_seconds=False,
     )
     return [
         SpeechCue(
-            start_ms=round(float(item["start"]) * 1000.0, 3),
-            end_ms=round(float(item["end"]) * 1000.0, 3),
+            start_ms=int(item["start"]) * 1000.0 / 16_000,
+            end_ms=int(item["end"]) * 1000.0 / 16_000,
         )
         for item in timestamps
         if float(item["end"]) > float(item["start"])

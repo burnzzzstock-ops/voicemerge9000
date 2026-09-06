@@ -1,2 +1,5 @@
 -r requirements.txt
+-r requirements-audio.txt
+torch==2.7.1
+torchaudio==2.7.1
 pytest==8.4.1

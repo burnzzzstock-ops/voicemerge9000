@@ -24,6 +24,7 @@ def test_official_rvc_runs_cli_as_a_module(monkeypatch, tmp_path: Path) -> None:
     def fake_run(command, **kwargs):
         captured["command"] = command
         captured["cwd"] = kwargs["cwd"]
+        captured["env"] = kwargs["env"]
         output = Path(command[command.index("--output") + 1])
         output.mkdir(parents=True, exist_ok=True)
         (output / source.name).write_bytes(b"converted")
@@ -41,8 +42,11 @@ def test_official_rvc_runs_cli_as_a_module(monkeypatch, tmp_path: Path) -> None:
 
     command = captured["command"]
     assert isinstance(command, list)
-    assert command[:3] == ["rvc-python", "-m", "infer.cli"]
-    assert captured["cwd"] == root
+    assert command[:3] == ["rvc-python", "-m", "engine.rvc_worker"]
+    assert command[command.index("--root") + 1] == str(root)
+    assert captured["env"]["TORCH_FORCE_WEIGHTS_ONLY_LOAD"] == "1"
+    assert captured["env"]["RVC_CUDA_GRAPH"] == "0"
+    assert captured["env"]["VOICEMERGE_MAX_GPU_GB"] == "6.5"
     assert outputs[source].read_bytes() == b"converted"
 
 

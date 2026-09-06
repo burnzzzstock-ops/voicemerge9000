@@ -107,6 +107,10 @@ def pad_or_trim_clip(clip: np.ndarray, target_length: int, sample_rate: int = 48
     if len(source) < target_length:
         result = _empty_like_length(source, target_length)
         result[: len(source)] = source
+        width = min(len(source), max(1, round(sample_rate * 0.005)))
+        if width:
+            fade = np.linspace(1.0, 0.0, width, dtype=np.float32)
+            result[len(source) - width:len(source)] *= fade[:, None] if result.ndim == 2 else fade
         return result
     if target_length == 0:
         return _empty_like_length(source, 0)

@@ -3,6 +3,9 @@
 .openai
 .pnpm-store
 .venv
+.local
+__pycache__
+*.pyc
 .vinext
 .wrangler
 dist

@@ -14,14 +14,14 @@ class StrictModel(BaseModel):
 
 class CueSegment(StrictModel):
     cue_id: str = Field(pattern=ID_PATTERN)
-    start_ms: int = Field(ge=0, le=14_400_000)
-    end_ms: int = Field(gt=0, le=14_400_000)
+    start_ms: float = Field(ge=0, le=14_400_000, allow_inf_nan=False)
+    end_ms: float = Field(gt=0, le=14_400_000, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def validate_range(self) -> "CueSegment":
         if self.end_ms <= self.start_ms:
             raise ValueError("end_ms must be greater than start_ms")
-        if self.end_ms - self.start_ms < 40:
+        if self.end_ms - self.start_ms < 40 - 1e-7:
             raise ValueError("a cue must be at least 40 ms long")
         return self
 
@@ -79,8 +79,8 @@ class ConversionRequest(JobSubmission):
 
 class SpeechCueResult(StrictModel):
     cue_id: str = Field(pattern=ID_PATTERN)
-    start_ms: int = Field(ge=0)
-    end_ms: int = Field(gt=0)
+    start_ms: float = Field(ge=0, allow_inf_nan=False)
+    end_ms: float = Field(gt=0, allow_inf_nan=False)
 
 
 JobStatus = Literal["queued", "processing", "analyzed", "completed", "failed"]
@@ -89,6 +89,7 @@ JobStatus = Literal["queued", "processing", "analyzed", "completed", "failed"]
 class JobCreated(StrictModel):
     job_id: str
     status: JobStatus
+    attempt_id: str | None = None
 
 
 class JobProgress(StrictModel):
@@ -102,6 +103,8 @@ class JobProgress(StrictModel):
     active_speaker: str | None = None
     downloaded_bytes: int | None = Field(default=None, ge=0)
     total_bytes: int | None = Field(default=None, ge=0)
+    attempt_id: str | None = None
+    analysis: AnalysisResponse | None = None
 
 
 class AnalysisResponse(StrictModel):
@@ -111,6 +114,8 @@ class AnalysisResponse(StrictModel):
     sample_rate: int = Field(gt=0)
     speech_coverage: float = Field(ge=0, le=1)
     cues: list[SpeechCueResult]
+    tracks: dict[str, str] = Field(default_factory=dict)
+    boundary_tolerance_ms: float = 150.0
 
 
 class HealthResponse(StrictModel):

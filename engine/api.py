@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-import math
+import hashlib
 import os
 import shutil
+import subprocess
 import threading
 import time
 import uuid
@@ -75,6 +76,9 @@ class JobRecord:
     downloaded_bytes: int | None = None
     total_bytes: int | None = None
     created_at: float = field(default_factory=time.time)
+    attempt_id: str | None = None
+    output_files: dict[tuple[str, str], Path] = field(default_factory=dict)
+    speaker_cache: dict[str, Path] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def response(self) -> JobProgress:
@@ -90,6 +94,8 @@ class JobRecord:
                 active_speaker=self.active_speaker,
                 downloaded_bytes=self.downloaded_bytes,
                 total_bytes=self.total_bytes,
+                attempt_id=self.attempt_id,
+                analysis=self.analysis_response() if self.status == "analyzed" else None,
             )
 
     def analysis_response(self) -> AnalysisResponse:
@@ -100,6 +106,7 @@ class JobRecord:
             sample_rate=self.sample_rate,
             speech_coverage=min(1.0, speech_ms / max(1, self.duration_ms)),
             cues=list(self.detected_cues),
+            tracks={key: _track_url(self.job_id, key) for key in ("vocals", "background")},
         )
 
 
@@ -135,14 +142,11 @@ def purge_expired_jobs() -> None:
     cutoff = time.time() - JOB_TTL_SECONDS
     terminal_states = {"analyzed", "completed", "failed"}
     with jobs_lock:
-        expired = [
-            job_id
-            for job_id, record in jobs.items()
-            if record.created_at < cutoff and record.status in terminal_states
-        ]
-        for job_id in expired:
-            record = jobs.pop(job_id)
-            shutil.rmtree(record.directory, ignore_errors=True)
+        for job_id, record in list(jobs.items()):
+            with record.lock:
+                if record.created_at < cutoff and record.status in terminal_states:
+                    jobs.pop(job_id)
+                    shutil.rmtree(record.directory, ignore_errors=True)
 
 
 def get_job(job_id: str) -> JobRecord:
@@ -158,8 +162,9 @@ def development_model() -> ModelArtifact:
     return ModelArtifact(Path("development-copy.pth"), None, "development")
 
 
-def _track_url(job_id: str, track_name: str) -> str:
-    return f"/api/v1/jobs/{job_id}/tracks/{track_name}.wav"
+def _track_url(job_id: str, track_name: str, attempt_id: str | None = None) -> str:
+    suffix = f"?attempt_id={attempt_id}" if attempt_id else ""
+    return f"/api/v1/jobs/{job_id}/tracks/{track_name}.wav{suffix}"
 
 
 def _fail_job(record: JobRecord, error: Exception | str) -> None:
@@ -191,16 +196,18 @@ def _normalize_separated_stems(record: JobRecord, vocals_path: str, background_p
     write_float_wav(record.directory / "background.wav", background, record.sample_rate)
 
 
-def _analyze_record(record: JobRecord) -> None:
+def _analyze_record(record: JobRecord, *, for_conversion: bool = False) -> None:
     try:
         with record.lock:
             record.status = "processing"
             record.progress = 0.05
-            record.stage = "separating_vocals"
+            record.stage = "queued_separation"
             record.error = None
         with gpu_slot:
+            with record.lock:
+                record.stage = "separating_vocals"
             vocals_path, background_path = separate_vocals(
-                str(record.directory / "source"),
+                str(record.directory / ("source.wav" if (record.directory / "source.wav").is_file() else "source")),
                 str(record.directory),
             )
         _normalize_separated_stems(record, vocals_path, background_path)
@@ -211,8 +218,9 @@ def _analyze_record(record: JobRecord) -> None:
         detected = get_speech_cues(str(record.directory / "vocals.wav"))
         cues: list[SpeechCueResult] = []
         for item in detected:
-            start_ms = max(0, min(record.duration_ms, round(item["start_ms"])))
-            end_ms = max(start_ms, min(record.duration_ms, round(item["end_ms"])))
+            exact_duration_ms = record.total_samples * 1000.0 / record.sample_rate
+            start_ms = max(0, min(exact_duration_ms, item["start_ms"]))
+            end_ms = max(start_ms, min(exact_duration_ms, item["end_ms"]))
             if end_ms - start_ms >= 40:
                 cues.append(
                     SpeechCueResult(
@@ -225,10 +233,12 @@ def _analyze_record(record: JobRecord) -> None:
                 break
         with record.lock:
             record.detected_cues = cues
-            record.status = "analyzed"
-            record.progress = 1
-            record.stage = "analyzed"
-            record.tracks = {"background": _track_url(record.job_id, "background")}
+            # Legacy upload+convert owns the job across this transition.
+            # Publishing a terminal state here would permit a competing retry.
+            record.status = "processing" if for_conversion else "analyzed"
+            record.progress = 0.9 if for_conversion else 1
+            record.stage = "preparing_vocals" if for_conversion else "analyzed"
+            record.tracks = {key: _track_url(record.job_id, key) for key in ("vocals", "background")}
     except Exception as error:
         _fail_job(record, error)
         raise
@@ -241,10 +251,12 @@ def _validate_timeline(record: JobRecord, submission: JobSubmission) -> None:
         if current.start_ms < previous.end_ms:
             raise ValueError("speaker cues may not overlap across the cast")
     for cue in ordered:
-        if cue.end_ms > record.duration_ms + 2:
+        # Tolerate JSON/browser seconds-to-ms round-off, not an extra audio sample.
+        if cue.end_ms > record.total_samples * 1000.0 / record.sample_rate + 1e-7:
             raise ValueError(f"{cue.cue_id} extends beyond the scene duration")
         is_confirmed_speech = any(
-            cue.start_ms >= detected.start_ms - 2 and cue.end_ms <= detected.end_ms + 2
+            cue.start_ms >= detected.start_ms - 150 - 1e-7 and cue.end_ms <= detected.end_ms + 150 + 1e-7
+            and cue.start_ms < detected.end_ms and cue.end_ms > detected.start_ms
             for detected in record.detected_cues
         )
         if not is_confirmed_speech:
@@ -260,18 +272,34 @@ def process_job(record: JobRecord) -> None:
         record.status = "processing"
         record.progress = 0.01
         record.stage = "preparing_vocals"
-    transient = record.directory / "work"
-    tracks_directory = record.directory / "tracks"
-    transient.mkdir(exist_ok=True)
-    tracks_directory.mkdir(exist_ok=True)
+    attempt_id = record.attempt_id or uuid.uuid4().hex
+    record.attempt_id = attempt_id
+    attempt_directory = record.directory / "attempts" / attempt_id
+    transient = attempt_directory / "work"
+    tracks_directory = attempt_directory / "tracks"
     completed_units = 0
     total_units = sum(len(speaker.cues) for speaker in submission.timeline)
     successful_stems: list[np.ndarray] = []
     try:
+        transient.mkdir(parents=True, exist_ok=True)
+        tracks_directory.mkdir(parents=True, exist_ok=True)
         vocals, sample_rate = read_audio_mono(record.directory / "vocals.wav", record.sample_rate)
         vocals = pad_or_trim_clip(vocals, record.total_samples, sample_rate)
         for speaker in submission.timeline:
             speaker_units = len(speaker.cues)
+            cache_key = hashlib.sha256(json.dumps({
+                "speaker": speaker.model_dump(exclude={"gain"}), "params": submission.params.model_dump(),
+                "sample_rate": sample_rate, "total_samples": record.total_samples,
+            }, sort_keys=True).encode()).hexdigest()
+            cached = record.speaker_cache.get(cache_key)
+            if cached and cached.is_file():
+                stem, _ = read_audio_mono(cached, sample_rate)
+                successful_stems.append(stem * np.float32(speaker.gain))
+                completed_units += speaker_units
+                with record.lock:
+                    record.output_files[(attempt_id, speaker.speaker_id)] = cached
+                    record.tracks[speaker.speaker_id] = _track_url(record.job_id, speaker.speaker_id, attempt_id)
+                continue
             base_progress = min(0.88, completed_units / max(1, total_units) * 0.86 + 0.02)
             speaker_span = speaker_units / max(1, total_units) * 0.86
 
@@ -311,7 +339,11 @@ def process_job(record: JobRecord) -> None:
                     record.total_bytes = None
                     record.progress = max(record.progress, min(0.88, base_progress + speaker_span * 0.2))
                 with gpu_slot:
-                    converted_files = engine.convert_batch(sources, outputs, model, submission.params)
+                    try:
+                        converted_files = engine.convert_batch(sources, outputs, model, submission.params)
+                    finally:
+                        if (outputs / ".gpu.json").is_file():
+                            shutil.copyfile(outputs / ".gpu.json", attempt_directory / f"gpu-{speaker.speaker_id}.json")
                 converted_cues: list[tuple[float, float, np.ndarray]] = []
                 for cue, cue_input in zip(speaker.cues, sources, strict=True):
                     converted, _ = read_audio_mono(converted_files[cue_input], sample_rate)
@@ -325,18 +357,23 @@ def process_job(record: JobRecord) -> None:
                 with record.lock:
                     record.stage = "assembling_speaker_stem"
                 stem = assemble_speaker_stem(converted_cues, record.total_samples, sample_rate)
-                gain_db = 20.0 * math.log10(speaker.gain)
+                # Cache canonical pre-fader audio. Per-voice peak protection must
+                # not cancel a later mix-gain adjustment or force new inference.
                 stem = peak_limit_and_normalize(
-                    stem * np.float32(speaker.gain),
-                    target_lufs=-18.0 + gain_db,
+                    stem,
+                    target_lufs=-18.0,
                     peak_limit=-1.0,
                     sample_rate=sample_rate,
                 )
                 track_path = tracks_directory / f"{speaker.speaker_id}.wav"
                 write_pcm24_wav(track_path, stem, sample_rate)
-                successful_stems.append(stem)
+                # Use the same quantized samples on fresh and cached paths.
+                canonical_stem, _ = read_audio_mono(track_path, sample_rate)
+                successful_stems.append(canonical_stem * np.float32(speaker.gain))
                 with record.lock:
-                    record.tracks[speaker.speaker_id] = _track_url(record.job_id, speaker.speaker_id)
+                    record.output_files[(attempt_id, speaker.speaker_id)] = track_path
+                    record.speaker_cache[cache_key] = track_path
+                    record.tracks[speaker.speaker_id] = _track_url(record.job_id, speaker.speaker_id, attempt_id)
             except Exception as error:
                 completed_units += speaker_units
                 with record.lock:
@@ -346,6 +383,8 @@ def process_job(record: JobRecord) -> None:
                         completed_units / max(1, total_units) * 0.86 + 0.02,
                     )
 
+        if record.speaker_errors:
+            raise RuntimeError("Some voices failed. No final master was created because dialogue would be missing. Retry to reuse successful voices.")
         if not successful_stems:
             raise RuntimeError("No speaker tracks could be converted.")
 
@@ -366,7 +405,8 @@ def process_job(record: JobRecord) -> None:
         write_pcm24_wav(master_path, master, sample_rate)
         with record.lock:
             record.tracks["background"] = _track_url(record.job_id, "background")
-            record.tracks["master"] = _track_url(record.job_id, "master")
+            record.output_files[(attempt_id, "master")] = master_path
+            record.tracks["master"] = _track_url(record.job_id, "master", attempt_id)
             record.status = "completed"
             record.progress = 1
             record.stage = "completed"
@@ -381,7 +421,7 @@ def process_job(record: JobRecord) -> None:
 
 def _process_legacy_job(record: JobRecord) -> None:
     try:
-        _analyze_record(record)
+        _analyze_record(record, for_conversion=True)
         if record.submission is None:
             raise ValueError("conversion has no timeline")
         _validate_timeline(record, record.submission)
@@ -403,7 +443,21 @@ async def _store_upload(audio_file: UploadFile) -> JobRecord:
                 if size > MAX_AUDIO_BYTES:
                     raise HTTPException(status_code=413, detail="audio file exceeds the upload limit")
                 target.write(chunk)
-        metadata = inspect_audio(audio_path)
+        try:
+            metadata = inspect_audio(audio_path)
+        except (RuntimeError, ValueError):
+            canonical = directory / "source.wav"
+            try:
+                decoded = await run_in_threadpool(subprocess.run, [
+                    "ffmpeg", "-nostdin", "-v", "error", "-i", str(audio_path),
+                    "-map", "0:a:0", "-vn", "-t", str(MAX_DURATION_SECONDS + 1),
+                    "-ar", str(TARGET_SAMPLE_RATE), "-ac", "2", "-c:a", "pcm_f32le", str(canonical),
+                ], capture_output=True, text=True, timeout=300, check=False)
+                if decoded.returncode:
+                    raise ValueError("The file has no supported audio stream or is damaged.")
+                metadata = inspect_audio(canonical)
+            except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError) as error:
+                raise HTTPException(status_code=422, detail="Audio decoding failed: no supported audio stream, damaged file, or FFmpeg unavailable. Try an MP3/WAV.") from error
         if metadata.duration_seconds > MAX_DURATION_SECONDS:
             raise HTTPException(status_code=413, detail="audio duration exceeds the job limit")
         return JobRecord(
@@ -430,12 +484,20 @@ def health(_: None = Depends(require_token)) -> HealthResponse:
 @app.post("/api/v1/analyze", response_model=AnalysisResponse)
 async def analyze_scene(
     audio_file: Annotated[UploadFile, File()],
+    background: bool = False,
     _: None = Depends(require_token),
-) -> AnalysisResponse:
+) -> AnalysisResponse | Response:
     purge_expired_jobs()
     record = await _store_upload(audio_file)
     with jobs_lock:
         jobs[record.job_id] = record
+    if background:
+        try:
+            executor.submit(_analyze_record, record)
+        except RuntimeError as error:
+            _fail_job(record, "The analysis worker could not start. Please upload again.")
+            raise HTTPException(status_code=503, detail=record.error) from error
+        return Response(JobCreated(job_id=record.job_id, status="queued").model_dump_json(), status_code=202, media_type="application/json")
     try:
         await run_in_threadpool(_analyze_record, record)
         return record.analysis_response()
@@ -452,28 +514,33 @@ def convert_scene(
     _: None = Depends(require_token),
 ) -> JobCreated:
     record = get_job(request.job_id)
-    with record.lock:
+    with jobs_lock, record.lock:
+        if jobs.get(record.job_id) is not record:
+            raise HTTPException(status_code=404, detail="job expired; upload again")
         if record.status in {"queued", "processing"}:
             raise HTTPException(status_code=409, detail="job is already running")
-    submission = JobSubmission(timeline=request.timeline, params=request.params)
-    try:
-        _validate_timeline(record, submission)
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-
-    tracks_directory = record.directory / "tracks"
-    shutil.rmtree(tracks_directory, ignore_errors=True)
-    with record.lock:
+        if not (record.directory / "vocals.wav").is_file():
+            raise HTTPException(status_code=409, detail="Analyze the scene again before converting.")
+        submission = JobSubmission(timeline=request.timeline, params=request.params).model_copy(deep=True)
+        try:
+            _validate_timeline(record, submission)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         record.submission = submission
+        record.attempt_id = uuid.uuid4().hex
         record.status = "queued"
         record.progress = 0
         record.stage = "queued"
-        record.tracks = {"background": _track_url(record.job_id, "background")}
+        record.tracks = {key: _track_url(record.job_id, key) for key in ("vocals", "background")}
         record.speaker_errors.clear()
         record.error = None
         record.created_at = time.time()
-    executor.submit(process_job, record)
-    return JobCreated(job_id=record.job_id, status="queued")
+    try:
+        executor.submit(process_job, record)
+    except RuntimeError as error:
+        _fail_job(record, "The worker could not start. Please retry.")
+        raise HTTPException(status_code=503, detail=record.error) from error
+    return JobCreated(job_id=record.job_id, status="queued", attempt_id=record.attempt_id)
 
 
 @app.post("/api/v1/jobs", response_model=JobCreated, status_code=202)
@@ -492,7 +559,11 @@ async def create_legacy_job(
     record.submission = submission
     with jobs_lock:
         jobs[record.job_id] = record
-    executor.submit(_process_legacy_job, record)
+    try:
+        executor.submit(_process_legacy_job, record)
+    except RuntimeError as error:
+        _fail_job(record, "The worker could not start. Please upload again.")
+        raise HTTPException(status_code=503, detail=record.error) from error
     return JobCreated(job_id=record.job_id, status="queued")
 
 
@@ -502,16 +573,14 @@ def read_job(job_id: str, _: None = Depends(require_token)) -> JobProgress:
 
 
 @app.get("/api/v1/jobs/{job_id}/tracks/{track_name}")
-def read_track(job_id: str, track_name: str, _: None = Depends(require_token)) -> FileResponse:
+def read_track(job_id: str, track_name: str, attempt_id: str | None = None, _: None = Depends(require_token)) -> FileResponse:
     record = get_job(job_id)
     key = track_name[:-4] if track_name.lower().endswith(".wav") else track_name
-    if key not in record.tracks:
+    with record.lock:
+        path = (record.directory / f"{key}.wav" if key in {"background", "vocals"}
+                else record.output_files.get((attempt_id or record.attempt_id or "", key)))
+    if path is None:
         raise HTTPException(status_code=404, detail="track is not ready")
-    path = (
-        record.directory / "background.wav"
-        if key == "background"
-        else record.directory / "tracks" / f"{key}.wav"
-    )
     if not path.is_file():
         raise HTTPException(status_code=404, detail="track has expired")
     return FileResponse(path, media_type="audio/wav", filename=f"{key}.wav")
@@ -520,9 +589,9 @@ def read_track(job_id: str, track_name: str, _: None = Depends(require_token)) -
 @app.delete("/api/v1/jobs/{job_id}", status_code=204, response_class=Response)
 def delete_job(job_id: str, _: None = Depends(require_token)) -> Response:
     record = get_job(job_id)
-    if record.status in {"queued", "processing"}:
-        raise HTTPException(status_code=409, detail="a running job cannot be deleted")
-    with jobs_lock:
+    with jobs_lock, record.lock:
+        if record.status in {"queued", "processing"}:
+            raise HTTPException(status_code=409, detail="a running job cannot be deleted")
         jobs.pop(job_id, None)
-    shutil.rmtree(record.directory, ignore_errors=True)
+        shutil.rmtree(record.directory, ignore_errors=True)
     return Response(status_code=204)

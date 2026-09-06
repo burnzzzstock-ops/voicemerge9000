@@ -98,7 +98,7 @@ def test_analyze_convert_and_master_round_trip(monkeypatch) -> None:
         status = wait_for_completion(client, analyzed["job_id"])
         assert status["status"] == "completed"
         assert status["progress"] == 1
-        assert set(status["tracks"]) == {"background", "master", "speaker-1"}
+        assert set(status["tracks"]) == {"vocals", "background", "master", "speaker-1"}
         assert len(converted_inputs) == 1
         assert len(converted_inputs[0]) == 9_600
 

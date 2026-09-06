@@ -47,3 +47,20 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# Private media and downloaded model artifacts (use generated synthetic test fixtures)
+*.wav
+*.mp3
+*.mp4
+*.flac
+*.m4a
+*.ogg
+*.pth
+*.pt
+*.onnx
+*.index
+*.safetensors
+*.zip
+*.7z
+*.tar
+*.tar.gz

@@ -1,6 +1,8 @@
 {
   "name": "voicemerge9000",
   "version": "0.1.0",
+  "license": "MIT",
+  "packageManager": "pnpm@11.25.0",
   "private": false,
   "engines": {
     "node": ">=22.13.0"
@@ -10,6 +12,8 @@
     "build": "vinext build",
     "start": "wrangler dev --config dist/server/wrangler.json",
     "lint": "oxlint",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "typecheck": "tsc --noEmit",
     "format": "oxfmt"
   },
   "dependencies": {

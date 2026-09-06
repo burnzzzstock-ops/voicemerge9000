@@ -5,7 +5,7 @@ services:
       context: .
       dockerfile: Dockerfile.web
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       RVC_ENGINE_URL: http://rvc-engine:8000
       RVC_ENGINE_API_TOKEN: ${VOICEMERGE_API_TOKEN:-change-me}

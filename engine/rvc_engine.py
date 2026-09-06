@@ -104,7 +104,9 @@ class RVCEngine:
                     shutil.copyfile(model.index, index_alias)
         command = [
             self.settings.python,
-            "-m", "infer.cli",
+            "-m", "engine.rvc_worker",
+            "--root", str(self.settings.root),
+            "--metrics", str(output_directory / ".gpu.json"),
             "--model", str(model.checkpoint),
             "--input", str(input_directory),
             "--output", str(output_directory),
@@ -124,10 +126,13 @@ class RVCEngine:
             if key in {"PATH", "PYTHONPATH", "CUDA_VISIBLE_DEVICES", "LD_LIBRARY_PATH", "HOME", "TEMP", "TMP", "TMPDIR"}
         }
         environment["TORCH_FORCE_WEIGHTS_ONLY_LOAD"] = "1"
+        environment["VOICEMERGE_MAX_GPU_GB"] = os.getenv("VOICEMERGE_MAX_GPU_GB", "6.5")
+        environment["RVC_CUDA_GRAPH"] = "0"
+        environment["PYTORCH_CUDA_ALLOC_CONF"] = "backend:native"
         try:
             result = subprocess.run(
                 command,
-                cwd=self.settings.root,
+                cwd=Path(__file__).resolve().parent.parent,
                 env=environment,
                 capture_output=True,
                 text=True,
@@ -142,8 +147,12 @@ class RVCEngine:
             gc.collect()
         outputs = {source: output_directory / source.name for source in sources}
         if result.returncode or any(not destination.is_file() for destination in outputs.values()):
+            if "out of memory" in (result.stderr + result.stdout).lower():
+                raise RVCInferenceError("GPU memory budget reached. Close other GPU apps or split the speech section, then retry. Successful voices are retained.")
             detail = (result.stderr or result.stdout or "RVC produced no output").strip().splitlines()[-1]
             raise RVCInferenceError(f"RVC conversion failed: {detail[:500]}")
+        if result.stdout.strip():
+            print(result.stdout.strip()[-3000:], flush=True)
         return outputs
 
     def convert(self, source: Path, destination: Path, model: ModelArtifact, params: RVCParams) -> None:
